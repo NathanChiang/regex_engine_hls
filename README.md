@@ -30,6 +30,7 @@ RE_HLS_ACTION=csim vitis_hls -f hls/run_hls.tcl
 RE_HLS_ACTION=synth vitis_hls -f hls/run_hls.tcl
 RE_HLS_ACTION=synth_only vitis_hls -f hls/run_hls.tcl
 RE_HLS_ACTION=export vitis_hls -f hls/run_hls.tcl
+RE_HLS_ACTION=perf vitis_hls -f hls/run_hls.tcl # synthesized RTL performance logs
 ```
 
 The default smoke test and kernel synthesis do not require Oniguruma, OpenCL,

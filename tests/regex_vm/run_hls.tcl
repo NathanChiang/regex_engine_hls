@@ -15,9 +15,17 @@
 #
 
 set here [file dirname [file normalize [info script]]]
+set root [file normalize "$here/../.."]
+# The named legacy entry point can also launch the full-kernel performance
+# flow without duplicating its synthesis setup:
+#   RE_HLS_ACTION=perf vitis_hls -f tests/regex_vm/run_hls.tcl
+if {[info exists ::env(RE_HLS_ACTION)] &&
+    $::env(RE_HLS_ACTION) in {perf perf_only}} {
+  source "$root/hls/run_hls.tcl"
+  exit
+}
 source "$here/settings.tcl"
 
-set root [file normalize "$here/../.."]
 if {[info exists ::env(REGEX_ENGINE_ROOT)]} { set root [file normalize $::env(REGEX_ENGINE_ROOT)] }
 set PROJ "re_test.prj"
 set SOLN "sol1"

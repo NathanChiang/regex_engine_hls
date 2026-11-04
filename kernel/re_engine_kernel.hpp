@@ -91,10 +91,42 @@ struct match_out {
     ap_uint<1>   halt;
 };
 
+// Performance telemetry is carried on a separate AXI4-Stream so observing it
+// cannot change the result protocol. The monitor writes a diagnostic FIFO
+// non-blockingly; a consumer should normally keep TREADY asserted. Two 512-bit
+// record types
+// are currently defined (bit 0 is the least-significant bit of TDATA):
+//
+// Message record (type = 1)
+//   [  3:  0] type                 [ 35:  4] message_id
+//   [ 43: 36] job_id               [ 51: 44] processing_unit
+//   [ 67: 52] message_bytes        [ 83: 68] configured_rule_bytes
+//   [123: 84] DMA SOP cycle        [163:124] IOVA lookup-done cycle
+//   [203:164] rule lookup cycle    [243:204] packet-ready cycle
+//   [283:244] dispatch cycle       [323:284] PU input-start cycle
+//   [363:324] VM compute-start     [403:364] VM compute-done
+//   [443:404] ordered-result-ready [459:444] DMA beat count
+//   [475:460] correlator drops     [511:476] reserved
+//
+// Engine snapshot (type = 2), emitted after each message record
+//   [  3:  0] type                 [ 35:  4] last message_id
+//   [ 83: 36] snapshot cycle
+//   [403: 84] PU 0..15 idle cycles since first DMA SOP, 20 bits each
+//   [427:404] cycles with every PU busy since first DMA SOP
+//   [451:428] ingress packet-handoff cycles
+//   [475:452] cumulative ready-to-dispatch cycles
+//   [491:476] correlator drops      [507:492] completed messages
+//   [511:508] reserved
+typedef ap_uint<512> RePerfRecord;
+
 extern "C" void reEngineKernel(
 
     // Passive PCIe/NVMe snoop stream
     hls::stream<DmaAxisBeat>& dma_in,
+
+    // Synthesized performance records. This channel is diagnostic only and
+    // is not on the functional result path.
+    hls::stream<RePerfRecord>& perf_out,
 
     // MMIO configuration
 #ifdef __SYNTHESIS__

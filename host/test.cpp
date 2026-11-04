@@ -311,6 +311,7 @@ int main(int argc, const char* argv[]) {
 #ifdef HLS_TEST
     // New reEngineKernel interface.
     hls::stream<DmaAxisBeat> dma_in;
+    hls::stream<RePerfRecord> perf_out;
     cfg_input cfg_in = {};
     cfg_output cfg_out = {};
     ap_uint<1> result_in = 0;
@@ -326,7 +327,7 @@ int main(int argc, const char* argv[]) {
 
     // One call is one FSM step, which takes multiple clocks in synthesized RTL.
     auto tick = [&]() {
-        reEngineKernel(dma_in, cfg_in, cfg_out, result_in, result_out);
+        reEngineKernel(dma_in, perf_out, cfg_in, cfg_out, result_in, result_out);
 
         // Reassemble the sixteen-word result chunks into the original
         // reEngine output layout so the existing reference comparison can be

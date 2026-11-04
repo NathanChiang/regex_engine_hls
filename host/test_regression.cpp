@@ -197,11 +197,12 @@ static void test_rule_replicas() {
 #endif
 
 static hls::stream<DmaAxisBeat> dma;
+static hls::stream<RePerfRecord> perf;
 static cfg_input cfg = {};
 static cfg_output status;
 static match_out result;
 static ap_uint<1> result_ack = 0;
-static void tick() { reEngineKernel(dma, cfg, status, result_ack, result); }
+static void tick() { reEngineKernel(dma, perf, cfg, status, result_ack, result); }
 static bool command(unsigned cmd, unsigned job = 0, uint64_t a = 0, uint64_t b = 0) {
     cfg.valid = 0; cfg.cmd = cmd; tick(); tick();
     cfg.job_id = job; cfg.arg0 = a; cfg.arg1 = b; cfg.valid = 1;

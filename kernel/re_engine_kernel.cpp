@@ -235,7 +235,8 @@ static void re_stream_ingress(hls::stream<DmaAxisBeat>& dma_in,
                               hls::stream<ReRuleUpdate>& rule_updates,
                               hls::stream<bool>& rule_update_done,
                               hls::stream<ReStreamJob>& jobs,
-                              hls::stream<ap_uint<512> >& messages) {
+                              hls::stream<ap_uint<512> >& messages,
+                              hls::stream<RePerfEvent>& perf_events) {
     ap_uint<4> state = RE_CFG_NONE;
     ap_uint<1> cfg_ack_held = 0;
     ap_uint<1> cfg_full_held = 0;
@@ -248,7 +249,10 @@ static void re_stream_ingress(hls::stream<DmaAxisBeat>& dma_in,
     ap_uint<16> packet_len = 0;
     ap_uint<5> selected_job_id = 0;
     ap_uint<16> selected_cpgp_nm = 0;
+    ap_uint<16> selected_rule_bytes = 0;
     ap_uint<1> selected_config_valid = 0;
+    ap_uint<32> current_message_id = 0;
+    ap_uint<32> next_message_id = 0;
 
     while (true) {
         cfg_input cfg_in;
@@ -282,19 +286,55 @@ static void re_stream_ingress(hls::stream<DmaAxisBeat>& dma_in,
                          selected_config_valid, packet_buf,
                          packet_beats, packet_len);
 
+            // One compact event can describe multiple milestones that occur
+            // in the same ingress cycle (the rule metadata lookup is chained
+            // directly from the IOVA response). Non-blocking diagnostic writes
+            // ensure a disconnected performance consumer cannot stall DMA.
+            RePerfEvent perf_event;
+            perf_event.flags = 0;
+            if (dma_address_valid) {
+                current_message_id = next_message_id++;
+                perf_event.flags |= RE_PERF_DMA_SOP;
+            }
+            if (iova_lookup.ack)
+                perf_event.flags |= RE_PERF_IOVA_DONE;
+            if (rule_lookup.ack) {
+                perf_event.flags |= RE_PERF_RULE_DONE;
+                selected_rule_bytes = rule_lookup.rule_bytes;
+            }
+            if (packet_ready)
+                perf_event.flags |= RE_PERF_PACKET_READY;
+            perf_event.message_id = current_message_id;
+            perf_event.job_id = selected_job_id;
+            perf_event.pu = 0;
+            perf_event.message_bytes = packet_len;
+            perf_event.rule_bytes = selected_rule_bytes;
+            perf_event.dma_beats = packet_beats;
+            if (perf_event.flags != 0)
+                perf_events.write_nb(perf_event);
+
             if (packet_ready) {
                 ReStreamJob job;
                 job.length = packet_len;
                 job.beats = packet_beats;
                 job.rule = selected_job_id.range(3, 0);
+                job.rule_bytes = selected_rule_bytes;
                 job.groups = selected_cpgp_nm;
                 job.address = dma_address;
+                job.message_id = current_message_id;
 
                 jobs.write(job);
                 for (int i = 0; i < packet_beats; ++i) {
 #pragma HLS pipeline II=1
                     messages.write(packet_buf[i]);
                 }
+
+                // Timestamp the actual end of the internal job/message FIFO
+                // handoff. This includes any queue backpressure encountered by
+                // the blocking functional writes above.
+                RePerfEvent handoff_event = perf_event;
+                handoff_event.flags = RE_PERF_HANDOFF_DONE;
+                perf_events.write_nb(handoff_event);
             }
         } else {
             dma_address_valid = 0;
@@ -408,10 +448,20 @@ static void re_stream_egress(volatile ap_uint<32> result_in[2],
         }
     }
 }
+
+// Isolate the external diagnostic AXIS handshake from the performance
+// monitor. The monitor writes the internal FIFO non-blockingly; only this
+// diagnostic egress process can wait on perf_out_TREADY.
+static void re_perf_egress(hls::stream<RePerfRecord>& records,
+                           hls::stream<RePerfRecord>& perf_out) {
+    while (true)
+        perf_out.write(records.read());
+}
 #endif
 
 extern "C" void reEngineKernel(
     hls::stream<DmaAxisBeat>& dma_in,
+    hls::stream<RePerfRecord>& perf_out,
 #ifdef __SYNTHESIS__
     volatile ap_uint<32> cfg_in[6],
 #else
@@ -440,6 +490,7 @@ extern "C" void reEngineKernel(
 #pragma HLS interface ap_ctrl_none port=return
 #endif
 #pragma HLS interface axis port=dma_in
+#pragma HLS interface axis port=perf_out
 #pragma HLS interface s_axilite port=cfg_in bundle=control
 #pragma HLS interface s_axilite port=cfg_out bundle=control
 #pragma HLS interface s_axilite port=result_in bundle=control
@@ -463,13 +514,21 @@ extern "C" void reEngineKernel(
     hls::stream<ap_uint<32> > output_words("output_words");
 #pragma HLS stream variable=output_words depth=1024
 #pragma HLS bind_storage variable=output_words type=fifo impl=bram
+    hls::stream<RePerfEvent> ingress_perf_events("ingress_perf_events");
+#pragma HLS stream variable=ingress_perf_events depth=64
+    hls::stream<RePerfRecord> perf_records("perf_records");
+#pragma HLS stream variable=perf_records depth=128
+#pragma HLS bind_storage variable=perf_records type=fifo impl=bram
 
     re_stream_ingress(dma_in, cfg_in, cfg_out,
-                      rule_updates, rule_update_done, jobs, messages);
+                      rule_updates, rule_update_done, jobs, messages,
+                      ingress_perf_events);
     re_streaming::engine<RE_PU_NM>(rule_updates, rule_update_done,
                                    jobs, messages,
-                                   output_order, output_words);
+                                   output_order, output_words,
+                                   ingress_perf_events, perf_records);
     re_stream_egress(result_in, result_out, output_order, output_words);
+    re_perf_egress(perf_records, perf_out);
 #else
     // Top-level FSM state. The numeric values intentionally match cfg_in.cmd.
     // A software command therefore requests the next kernel state directly.

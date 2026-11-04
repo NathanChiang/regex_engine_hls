@@ -1,7 +1,7 @@
 # VCK190 / Vitis HLS 2021.2 verification
 
 This target is a standalone Vivado IP with AXI-Lite configuration/results and
-AXI4-Stream DMA input, targeting `xcvc1902-vsva2197-2MP-e-S` at a 9 ns clock.
+AXI4-Stream DMA input, targeting `xcvc1902-vsva2197-2MP-e-S` at a 6 ns clock.
 The legacy Alveo OpenCL host path and `conn_u*.cfg` files do not connect this
 interface. Integrate the exported IP in the VCK190 PL design.
 
@@ -21,6 +21,10 @@ RE_HLS_ACTION=synth_only vitis_hls -f run_hls.tcl # skip long C regression
 # then drive the generated RTL through its real AXI-Lite and AXIS interfaces:
 RE_HLS_ACTION=cosim RE_HLS_COSIM_LINES=1000 vitis_hls -f run_hls.tcl
 RE_HLS_ACTION=cosim_only RE_HLS_COSIM_LINES=1000 vitis_hls -f run_hls.tcl # reuse existing csynth RTL
+
+# Synthesized three-rule/three-message-length performance matrix:
+RE_HLS_ACTION=perf vitis_hls -f run_hls.tcl
+RE_HLS_ACTION=perf_only vitis_hls -f run_hls.tcl # reuse re_engine_perf/perf RTL
 
 # Start-once production RTL, including AXI-Lite bus transactions:
 RE_HLS_RTL_PROJECT=re_engine_direct_array_status python3 run_rtl_mmio.py
@@ -53,6 +57,38 @@ test uses a separate `re_engine_log` project and the C/RTL test uses
 `re_engine_cosim`, preventing multiple test-bench entry points from entering
 one project. Use a clean project if changing tool versions.
 
+## Performance C/RTL benchmark
+
+`RE_HLS_ACTION=perf` runs `host/test_perf.sv` against the csynth RTL. It
+configures job IDs 1, 2, and 3 at the simple page ranges `0x1000..0x1fff`,
+`0x2000..0x2fff`, and `0x3000..0x3fff`. Their synthetic linear rule images
+are 80, 528, and 1552 bytes (8, 64, and 192 VM instruction words). Each rule
+is crossed with 256, 1024, and 4088-byte messages four times, producing 36
+jobs so the dispatcher can overlap all 16 processing units.
+
+The run writes three inspectable files under
+`build/perf_cosim_re_engine_perf/`: `perf_workload.log` maps message IDs to
+inputs, `perf_message_results.log` records returned words without checking
+them, and `perf_engine.log` contains timing, utilization, and DMA-stall data.
+
+Per-message records separate IOVA lookup, chained rule lookup, packet/lookup
+join, ready-to-dispatch scheduling, PU input/load, VM execution, and ordered
+result wait. Engine snapshots contain all 16 synthesized PU-idle counters and
+all-PUs-busy cycles measured from the first DMA SOP, actual internal
+packet-handoff cycles (including FIFO backpressure), and cumulative scheduling
+delay. The testbench independently
+counts every interface `TVALID && !TREADY` cycle. Correlating those intervals
+with handoff, all-busy, and scheduler counters identifies ingress-copy pressure
+versus processing saturation. The current chained rule-metadata lookup can
+correctly measure zero cycles after IOVA completion.
+
+Telemetry leaves through the dedicated 512-bit `perf_out` AXI4-Stream. Its
+record layout is documented beside `RePerfRecord` in
+`kernel/re_engine_kernel.hpp`. Diagnostic taps and the monitor's internal FIFO
+writes are non-blocking, so telemetry cannot stall functional matching. A
+dedicated egress process may wait for `perf_out_TREADY`; the supplied testbench
+keeps it asserted. Up to 64 messages may be in flight.
+
 ## Interface contract
 
 - `DmaAxisBeat` is now `ap_axiu<512,65,0,0>`, so the RTL has real `TKEEP`,
@@ -74,6 +110,8 @@ one project. Use a clean project if changing tool versions.
   defined drop policy when the queue fills.
 - Pending MMIO results do not raise `result_out.halt` in streaming hardware;
   AXIS `TREADY` supplies input backpressure when necessary.
+- `perf_out` carries diagnostic message-timing and engine-snapshot records; it
+  does not replace the MMIO match-result interface.
 - `regexVM_opt` pipelines VM loop iterations at II=3; it does not expose three
   independent message slots. A PU is reusable only after its VM call and
   result copy finish, so its message and capture buffers are no longer in use.

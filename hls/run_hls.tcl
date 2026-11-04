@@ -1,6 +1,7 @@
 # Vitis HLS 2021.2, VCK190 PL, standalone Vivado IP flow.
-# RE_HLS_ACTION: csim | synth (default) | synth_only | cosim | cosim_only | export
-# RE_HLS_TESTBENCH: smoke (default, dependency-free) | log (Linux libraries)
+# RE_HLS_ACTION: csim | synth (default) | synth_only | cosim | cosim_only |
+#                perf | perf_only | export
+# RE_HLS_TESTBENCH: smoke (default) | log (Linux libraries) | cosim | perf
 # cosim always uses host/test_cosim.{cpp,sv} against the post-csynth RTL.
 # All paths derive from this standalone package. REGEX_ENGINE_ROOT may override it.
 set here [file dirname [file normalize [info script]]]
@@ -10,9 +11,10 @@ set action synth
 if {[info exists ::env(RE_HLS_ACTION)]} { set action $::env(RE_HLS_ACTION) }
 set bench smoke
 if {[info exists ::env(RE_HLS_TESTBENCH)]} { set bench $::env(RE_HLS_TESTBENCH) }
-if {$action ni {csim synth synth_only cosim cosim_only export}} { error "Unknown RE_HLS_ACTION: $action" }
+if {$action ni {csim synth synth_only cosim cosim_only perf perf_only export}} { error "Unknown RE_HLS_ACTION: $action" }
 if {$action in {cosim cosim_only}} { set bench cosim }
-if {$bench ni {smoke log cosim}} { error "Unknown RE_HLS_TESTBENCH: $bench" }
+if {$action in {perf perf_only}} { set bench perf }
+if {$bench ni {smoke log cosim perf}} { error "Unknown RE_HLS_TESTBENCH: $bench" }
 if {[info exists ::env(DEBUG)]} { unset ::env(DEBUG) }
 
 set flags "-std=c++14 -D__gmp_const=const -DHLS_TEST -I$root/kernel -I$root/include/hw"
@@ -27,6 +29,7 @@ cd "$here/build"
 set project re_engine
 if {$bench eq "log"} { append project _log }
 if {$bench eq "cosim"} { append project _cosim }
+if {$bench eq "perf"} { append project _perf }
 if {$action eq "synth_only"} { append project _direct }
 if {[info exists ::env(RE_HLS_PROJECT_SUFFIX)]} { append project $::env(RE_HLS_PROJECT_SUFFIX) }
 open_project $project
@@ -52,7 +55,7 @@ config_rtl -reset control
 if {$action in {csim synth export}} {
     csim_design -clean -ldflags $ldflags -argv $tbargs
 }
-if {$action in {synth synth_only cosim export}} { csynth_design }
+if {$action in {synth synth_only cosim perf export}} { csynth_design }
 if {$action in {cosim cosim_only}} {
     # The production top is start-once and intentionally has no ap_done.
     # Standard transaction-oriented cosim_design cannot update its live MMIO
@@ -66,6 +69,16 @@ if {$action in {cosim cosim_only}} {
     set cosim_status [catch {exec {*}$cosim_cmd 2>@1} cosim_output]
     puts $cosim_output
     if {$cosim_status} { error "Persistent RTL C/RTL regression failed" }
+}
+if {$action in {perf perf_only}} {
+    # The performance bench also drives the start-once csynth RTL directly.
+    # It consumes synthesized telemetry and never compares match correctness.
+    set python python3
+    if {[info exists ::env(RE_HLS_PYTHON)]} { set python $::env(RE_HLS_PYTHON) }
+    set perf_cmd [list $python "$here/run_perf_cosim.py" --project $project --solution $bench]
+    set perf_status [catch {exec {*}$perf_cmd 2>@1} perf_output]
+    puts $perf_output
+    if {$perf_status} { error "Persistent RTL performance simulation failed" }
 }
 if {$action eq "export"} { export_design -format ip_catalog }
 exit

@@ -21,6 +21,8 @@ module tb_mmio;
   reg [64:0] tuser = 0;
   reg tlast = 0, tvalid = 0;
   wire tready;
+  wire [511:0] perf_tdata;
+  wire perf_tvalid;
   reEngineKernel dut (
     .ap_clk(clk), .ap_rst_n(reset_n),
     .s_axi_control_AWADDR(awaddr), .s_axi_control_AWVALID(awvalid), .s_axi_control_AWREADY(awready),
@@ -31,7 +33,8 @@ module tb_mmio;
     .s_axi_control_RDATA(rdata), .s_axi_control_RRESP(rresp),
     .s_axi_control_RVALID(rvalid), .s_axi_control_RREADY(1'b1),
     .dma_in_TDATA(tdata), .dma_in_TKEEP(tkeep), .dma_in_TSTRB(tkeep),
-    .dma_in_TUSER(tuser), .dma_in_TLAST(tlast), .dma_in_TVALID(tvalid), .dma_in_TREADY(tready)
+    .dma_in_TUSER(tuser), .dma_in_TLAST(tlast), .dma_in_TVALID(tvalid), .dma_in_TREADY(tready),
+    .perf_out_TDATA(perf_tdata), .perf_out_TVALID(perf_tvalid), .perf_out_TREADY(1'b1)
   );
   initial begin
     repeat (2000000) @(posedge clk);

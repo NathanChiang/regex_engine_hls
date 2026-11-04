@@ -29,6 +29,8 @@ module test_cosim;
   reg tlast = 0;
   reg tvalid = 0;
   wire tready;
+  wire [511:0] perf_tdata;
+  wire perf_tvalid;
 
   reEngineKernel dut (
     .ap_clk(clk),
@@ -56,7 +58,10 @@ module test_cosim;
     .dma_in_TUSER(tuser),
     .dma_in_TLAST(tlast),
     .dma_in_TVALID(tvalid),
-    .dma_in_TREADY(tready)
+    .dma_in_TREADY(tready),
+    .perf_out_TDATA(perf_tdata),
+    .perf_out_TVALID(perf_tvalid),
+    .perf_out_TREADY(1'b1)
   );
 
   initial begin

@@ -39,6 +39,8 @@ struct re_rule_lookup_status {
     ap_uint<1> config_valid;
     ap_uint<16> job_id;
     ap_uint<16> cpgp_nm;
+    // Total configured rule image size, including the two header words.
+    ap_uint<16> rule_bytes;
 };
 
 // C simulation keeps the replicas here so the step-model regression can inspect
@@ -202,6 +204,7 @@ inline void re_engine_rule_table(
     lookup.config_valid = 0;
     lookup.job_id = 0;
     lookup.cpgp_nm = 0;
+    lookup.rule_bytes = 0;
 
     switch (state) {
     case RULE_IDLE:
@@ -319,6 +322,9 @@ inline void re_engine_rule_table(
                     lookup.hit = 1;
                     lookup.config_valid = re_rule_table_internal::config_valid(job_index);
                     lookup.cpgp_nm = re_rule_table_internal::re_rule_cpgp_count[job_index];
+                    lookup.rule_bytes =
+                        re_rule_table_internal::re_rule_word_count[job_index] *
+                        RE_RULE_WORD_BYTES;
                 }
             }
         } else {

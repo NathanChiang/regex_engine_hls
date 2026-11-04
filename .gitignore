@@ -1,0 +1,16 @@
+/hls/build/
+/tests/regex_vm/build/
+/tests/regex_vm/settings.tcl
+/re_compile/oniguruma/
+/re_compile/lib/
+/log_data/*.log
+!/log_data/access_5k.log
+/build_dir.*/
+/_x_temp.*/
+/reports/
+/.Xil/
+/emconfig.json
+/*.log
+/*.jou
+/*.xclbin
+/*.run_summary

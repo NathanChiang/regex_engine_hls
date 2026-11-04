@@ -1,0 +1,6 @@
+/build/
+/.Xil/
+/prj/
+*.log
+*.jou
+.ipcache

@@ -9,12 +9,36 @@
 // AXI4-Stream keep has one bit per byte.
 static ap_uint<7> keep_bytes(ap_uint<64> keep) {
 #pragma HLS inline
+    // KEEP is required to be a non-zero, contiguous low-bit mask. Determine
+    // the highest set bit with a fixed-depth tree instead of a 64-input
+    // population-count loop in the DMA capture recurrence.
     ap_uint<7> bytes = 0;
-    for (int i = 0; i < 64; ++i) {
-#pragma HLS unroll
-        if (keep[i])
-            bytes += 1;
+    ap_uint<64> remaining = keep;
+    if (remaining.range(63, 32) != 0) {
+        bytes += 32;
+        remaining >>= 32;
     }
+    if (remaining.range(31, 16) != 0) {
+        bytes += 16;
+        remaining >>= 16;
+    }
+    if (remaining.range(15, 8) != 0) {
+        bytes += 8;
+        remaining >>= 8;
+    }
+    if (remaining.range(7, 4) != 0) {
+        bytes += 4;
+        remaining >>= 4;
+    }
+    if (remaining.range(3, 2) != 0) {
+        bytes += 2;
+        remaining >>= 2;
+    }
+    if (remaining.range(1, 1) != 0) {
+        bytes += 1;
+        remaining >>= 1;
+    }
+    if (remaining[0]) bytes += 1;
     return bytes;
 }
 
@@ -227,44 +251,207 @@ static void read_cfg_mmio(volatile ap_uint<32> cfg_mmio[6],
     cfg_in.arg1 = (ap_uint<64>(arg1_hi) << 32) | arg1_lo;
 }
 
-// This is the continuously running input/configuration side of the kernel.
-// The AXI-Lite command and result ports remain live while VM workers run.
-static void re_stream_ingress(hls::stream<DmaAxisBeat>& dma_in,
-                              volatile ap_uint<32> cfg_mmio[6],
-                              volatile ap_uint<32> cfg_out_mmio[1],
-                              hls::stream<ReRuleUpdate>& rule_updates,
-                              hls::stream<bool>& rule_update_done,
-                              hls::stream<ReStreamJob>& jobs,
-                              hls::stream<ap_uint<512> >& messages,
-                              hls::stream<RePerfEvent>& perf_events) {
+struct RePacketStart {
+    ap_uint<64> address;
+    ap_uint<32> message_id;
+};
+
+struct ReCapturedPacket {
+    ap_uint<64> address;
+    ap_uint<32> message_id;
+    ap_uint<16> length;
+    ap_uint<9> beats;
+    ap_uint<1> valid;
+};
+
+struct ReMappedPacket {
+    ap_uint<64> address;
+    ap_uint<32> message_id;
+    ap_uint<5> job_id;
+    ap_uint<16> groups;
+    ap_uint<16> rule_bytes;
+    ap_uint<1> valid;
+};
+
+// Capture is intentionally independent of AXI-Lite polling and table lookup.
+// Once enabled, its steady-state service rate is one 512-bit beat per clock.
+static void re_dma_capture(hls::stream<DmaAxisBeat>& dma_in,
+                           hls::stream<ap_uint<1> >& enable_commands,
+                           hls::stream<bool>& quiesced,
+                           hls::stream<RePacketStart>& packet_starts,
+                           hls::stream<ReCapturedPacket>& captured_packets,
+                           hls::stream<ap_uint<512> >& captured_words,
+                           hls::stream<RePerfEvent>& perf_events) {
+    static ap_uint<1> enabled = 0;
+    // The configuration process also starts in the quiesced state. Do not
+    // leave an initial stale acknowledgement in this FIFO.
+    static ap_uint<1> quiesced_reported = 1;
+    static ap_uint<32> next_message_id = 0;
+
+    while (true) {
+        ap_uint<1> command;
+        if (enable_commands.read_nb(command)) {
+            enabled = command;
+            if (command) quiesced_reported = 0;
+        }
+
+        if (!enabled) {
+            if (!quiesced_reported && quiesced.write_nb(true))
+                quiesced_reported = 1;
+            continue;
+        }
+
+        DmaAxisBeat beat;
+        if (!dma_in.read_nb(beat)) continue;
+
+        // A malformed fragment without SOP is still consumed through TLAST.
+        // Keeping the body in a dedicated pipelined loop avoids imposing the
+        // outer control FSM's latency on every payload beat.
+        if (!beat.user[0]) {
+            bool drain_done = beat.last;
+            while (!drain_done) {
+#pragma HLS pipeline II=1
+                ap_uint<1> drain_command;
+                if (enable_commands.read_nb(drain_command)) {
+                    enabled = drain_command;
+                    if (drain_command) quiesced_reported = 0;
+                }
+                DmaAxisBeat drain_beat = dma_in.read();
+                drain_done = drain_beat.last;
+            }
+            continue;
+        }
+
+        ap_uint<32> message_id = next_message_id++;
+        ap_uint<64> address = beat.user.range(64, 1);
+        ap_uint<16> length = keep_bytes(beat.keep);
+        ap_uint<9> beats = 1;
+        ap_uint<1> packet_valid = valid_keep(beat);
+
+        RePacketStart start;
+        start.address = address;
+        start.message_id = message_id;
+        packet_starts.write(start);
+        captured_words.write(beat.data);
+
+        RePerfEvent event;
+        event.flags = RE_PERF_DMA_SOP;
+        event.message_id = message_id;
+        event.job_id = 0;
+        event.pu = 0;
+        event.message_bytes = 0;
+        event.rule_bytes = 0;
+        event.dma_beats = 0;
+        perf_events.write_nb(event);
+
+        // The packet body is the throughput-critical loop. Blocking reads keep
+        // TREADY asserted while data is absent and allow HLS to implement one
+        // accepted 512-bit beat per clock when data is present.
+        bool packet_done = beat.last;
+        while (!packet_done) {
+#pragma HLS pipeline II=1
+            ap_uint<1> body_command;
+            if (enable_commands.read_nb(body_command)) {
+                enabled = body_command;
+                if (body_command) quiesced_reported = 0;
+            }
+
+            DmaAxisBeat body_beat = dma_in.read();
+            if (body_beat.user[0] || !valid_keep(body_beat)) packet_valid = 0;
+            if (beats < RE_DMA_MAX_BEATS) {
+                captured_words.write(body_beat.data);
+                beats++;
+                length += keep_bytes(body_beat.keep);
+            } else {
+                packet_valid = 0;
+            }
+            packet_done = body_beat.last;
+        }
+
+        ReCapturedPacket packet;
+        packet.address = address;
+        packet.message_id = message_id;
+        packet.length = length;
+        packet.beats = beats;
+        packet.valid = packet_valid && length != 0 &&
+                       length <= RE_MAX_PACKET_BYTES;
+        captured_packets.write(packet);
+    }
+}
+
+// Configuration and lookup can have a multi-cycle service interval without
+// throttling the DMA interface. Packet-start descriptors are queued while the
+// capture process continues accepting payload beats.
+static void re_config_lookup(volatile ap_uint<32> cfg_mmio[6],
+                             volatile ap_uint<32> cfg_out_mmio[1],
+                             hls::stream<ap_uint<1> >& enable_commands,
+                             hls::stream<bool>& capture_quiesced_events,
+                             hls::stream<RePacketStart>& packet_starts,
+                             hls::stream<ReMappedPacket>& mapped_packets,
+                             hls::stream<bool>& packet_completions,
+                             hls::stream<ReRuleUpdate>& rule_updates,
+                             hls::stream<bool>& rule_update_done,
+                             hls::stream<RePerfEvent>& perf_events) {
     ap_uint<4> state = RE_CFG_NONE;
     ap_uint<1> cfg_ack_held = 0;
     ap_uint<1> cfg_full_held = 0;
-    ap_uint<64> dma_address = 0;
-    ap_uint<1> dma_address_valid = 0;
-    ap_uint<1> dma_busy = 0;
-    ap_uint<512> packet_buf[RE_DMA_MAX_BEATS];
-#pragma HLS bind_storage variable=packet_buf type=ram_2p impl=bram
-    ap_uint<7> packet_beats = 0;
-    ap_uint<16> packet_len = 0;
-    ap_uint<5> selected_job_id = 0;
-    ap_uint<16> selected_cpgp_nm = 0;
-    ap_uint<16> selected_rule_bytes = 0;
-    ap_uint<1> selected_config_valid = 0;
-    ap_uint<32> current_message_id = 0;
-    ap_uint<32> next_message_id = 0;
+    ap_uint<1> capture_on = 0;
+    ap_uint<1> capture_quiesced = 1;
+    ap_uint<1> lookup_active = 0;
+    // The IOVA FSM holds IOVA_WAIT_LOOKUP_VALID_LOW for one invocation after
+    // acknowledging a request. Keep dma_address_valid low for that complete
+    // invocation before dequeuing the next packet descriptor.
+    ap_uint<1> lookup_rearm = 0;
+    ap_uint<7> outstanding_packets = 0;
+    RePacketStart pending_start;
 
     while (true) {
         cfg_input cfg_in;
         cfg_output cfg_status;
         read_cfg_mmio(cfg_mmio, cfg_in);
+
+        bool capture_stopped;
+        if (capture_quiesced_events.read_nb(capture_stopped))
+            capture_quiesced = 1;
+
+        ap_uint<7> next_outstanding = outstanding_packets;
+        bool completed;
+        if (packet_completions.read_nb(completed) && next_outstanding != 0)
+            next_outstanding--;
+
+        // Stop admission before changing configuration. Capture acknowledges
+        // only at a packet boundary, so no SOP can race a table update.
+        bool runtime_stop_requested =
+            state == RE_CFG_NONE &&
+            (cfg_in.cmd != RE_CFG_NONE || cfg_in.valid);
+        if (capture_on && runtime_stop_requested) {
+            if (enable_commands.write_nb(0)) {
+                capture_on = 0;
+                capture_quiesced = 0;
+            }
+        }
+
+        ap_uint<64> dma_address = 0;
+        ap_uint<1> dma_address_valid = 0;
+        bool rearm_cycle = lookup_rearm;
+        if (state == RE_CFG_NONE && !lookup_active && !lookup_rearm) {
+            RePacketStart start;
+            if (packet_starts.read_nb(start)) {
+                pending_start = start;
+                dma_address = start.address;
+                dma_address_valid = 1;
+                lookup_active = 1;
+                next_outstanding++;
+            }
+        }
+
         re_iova_cfg_status iova_status;
         re_iova_lookup_status iova_lookup;
         re_rule_cfg_status rule_status;
         re_rule_lookup_status rule_lookup;
         cfg_input table_cfg = cfg_in;
         table_cfg.cmd = state;
-        if (state == RE_CFG_NONE && dma_busy) {
+        if (state == RE_CFG_NONE) {
             table_cfg.valid = 0;
             table_cfg.job_id = 0;
             table_cfg.arg0 = 0;
@@ -276,74 +463,46 @@ static void re_stream_ingress(hls::stream<DmaAxisBeat>& dma_in,
                              rule_updates, rule_update_done,
                              rule_status, rule_lookup);
 
-        ap_uint<1> packet_ready = 0;
-        if (state == RE_CFG_NONE) {
-            ap_uint<1> runtime_enable =
-                !dma_busy && cfg_in.cmd == RE_CFG_NONE && !cfg_in.valid;
-            dma_frontend(dma_in, runtime_enable, rule_lookup, dma_address,
-                         dma_address_valid, dma_busy, packet_ready,
-                         selected_job_id, selected_cpgp_nm,
-                         selected_config_valid, packet_buf,
-                         packet_beats, packet_len);
-
-            // One compact event can describe multiple milestones that occur
-            // in the same ingress cycle (the rule metadata lookup is chained
-            // directly from the IOVA response). Non-blocking diagnostic writes
-            // ensure a disconnected performance consumer cannot stall DMA.
-            RePerfEvent perf_event;
-            perf_event.flags = 0;
-            if (dma_address_valid) {
-                current_message_id = next_message_id++;
-                perf_event.flags |= RE_PERF_DMA_SOP;
-            }
-            if (iova_lookup.ack)
-                perf_event.flags |= RE_PERF_IOVA_DONE;
-            if (rule_lookup.ack) {
-                perf_event.flags |= RE_PERF_RULE_DONE;
-                selected_rule_bytes = rule_lookup.rule_bytes;
-            }
-            if (packet_ready)
-                perf_event.flags |= RE_PERF_PACKET_READY;
-            perf_event.message_id = current_message_id;
-            perf_event.job_id = selected_job_id;
-            perf_event.pu = 0;
-            perf_event.message_bytes = packet_len;
-            perf_event.rule_bytes = selected_rule_bytes;
-            perf_event.dma_beats = packet_beats;
-            if (perf_event.flags != 0)
-                perf_events.write_nb(perf_event);
-
-            if (packet_ready) {
-                ReStreamJob job;
-                job.length = packet_len;
-                job.beats = packet_beats;
-                job.rule = selected_job_id.range(3, 0);
-                job.rule_bytes = selected_rule_bytes;
-                job.groups = selected_cpgp_nm;
-                job.address = dma_address;
-                job.message_id = current_message_id;
-
-                jobs.write(job);
-                for (int i = 0; i < packet_beats; ++i) {
-#pragma HLS pipeline II=1
-                    messages.write(packet_buf[i]);
-                }
-
-                // Timestamp the actual end of the internal job/message FIFO
-                // handoff. This includes any queue backpressure encountered by
-                // the blocking functional writes above.
-                RePerfEvent handoff_event = perf_event;
-                handoff_event.flags = RE_PERF_HANDOFF_DONE;
-                perf_events.write_nb(handoff_event);
-            }
-        } else {
-            dma_address_valid = 0;
+        if (iova_lookup.ack || rule_lookup.ack) {
+            RePerfEvent event;
+            event.flags = 0;
+            if (iova_lookup.ack) event.flags |= RE_PERF_IOVA_DONE;
+            if (rule_lookup.ack) event.flags |= RE_PERF_RULE_DONE;
+            event.message_id = pending_start.message_id;
+            event.job_id = rule_lookup.job_id.range(7, 0);
+            event.pu = 0;
+            event.message_bytes = 0;
+            event.rule_bytes = rule_lookup.rule_bytes;
+            event.dma_beats = 0;
+            perf_events.write_nb(event);
         }
 
+        if (rule_lookup.ack) {
+            ReMappedPacket mapped;
+            mapped.address = pending_start.address;
+            mapped.message_id = pending_start.message_id;
+            mapped.job_id = rule_lookup.job_id.range(4, 0);
+            mapped.groups = rule_lookup.cpgp_nm;
+            mapped.rule_bytes = rule_lookup.rule_bytes;
+            mapped.valid = rule_lookup.hit && rule_lookup.config_valid;
+            mapped_packets.write(mapped);
+            lookup_active = 0;
+            lookup_rearm = 1;
+        }
+        else if (rearm_cycle) {
+            lookup_rearm = 0;
+        }
+
+        outstanding_packets = next_outstanding;
+        bool runtime_busy = lookup_active || lookup_rearm ||
+                            next_outstanding != 0 ||
+                            !packet_starts.empty() ||
+                            (!capture_on && !capture_quiesced);
         cfg_input active_cfg = cfg_in;
         active_cfg.cmd = state;
         mux_cfg_output(active_cfg, iova_status, rule_status,
-                       dma_busy, iova_status.table_ready && rule_status.table_ready,
+                       runtime_busy,
+                       iova_status.table_ready && rule_status.table_ready,
                        cfg_status);
         if (!cfg_in.valid) {
             cfg_ack_held = 0;
@@ -354,13 +513,18 @@ static void re_stream_ingress(hls::stream<DmaAxisBeat>& dma_in,
             cfg_status.ack = cfg_ack_held;
             cfg_status.full = cfg_full_held;
         }
-        if (state == RE_CFG_NONE && (dma_busy || packet_ready))
+
+        bool runtime_drained = capture_quiesced && !lookup_active &&
+                               !lookup_rearm &&
+                               next_outstanding == 0 && packet_starts.empty();
+        if (state == RE_CFG_NONE && runtime_stop_requested &&
+            !runtime_drained)
             cfg_status.cmd_transition_allowed = 0;
 
         if (cfg_in.cmd != state) {
             ap_uint<1> transition_allowed = 0;
             if (state == RE_CFG_NONE) {
-                transition_allowed = !dma_busy && !packet_ready &&
+                transition_allowed = runtime_drained &&
                     iova_status.cmd_transition_allowed &&
                     rule_status.cmd_transition_allowed;
             } else if (state == RE_CFG_CLEAR) {
@@ -373,12 +537,75 @@ static void re_stream_ingress(hls::stream<DmaAxisBeat>& dma_in,
             }
             if (transition_allowed) state = cfg_in.cmd;
         }
+
+        bool tables_ready = iova_status.table_ready && rule_status.table_ready;
+        bool runtime_enable_requested = state == RE_CFG_NONE &&
+            cfg_in.cmd == RE_CFG_NONE && !cfg_in.valid && tables_ready;
+        if (!capture_on && capture_quiesced && runtime_enable_requested) {
+            if (enable_commands.write_nb(1)) {
+                capture_on = 1;
+                capture_quiesced = 0;
+            }
+        }
+
         ap_uint<32> status_word = 0;
         status_word[0] = cfg_status.ack;
         status_word[8] = cfg_status.full;
         status_word[16] = cfg_status.cmd_transition_allowed;
         status_word[24] = cfg_status.engine_ready;
         cfg_out_mmio[0] = status_word;
+    }
+}
+
+// Pair independently completed lookup and capture descriptors in SOP order,
+// drain malformed packets, and forward valid jobs at one beat per clock.
+static void re_packet_join(hls::stream<ReMappedPacket>& mapped_packets,
+                           hls::stream<ReCapturedPacket>& captured_packets,
+                           hls::stream<ap_uint<512> >& captured_words,
+                           hls::stream<bool>& packet_completions,
+                           hls::stream<ReStreamJob>& jobs,
+                           hls::stream<ap_uint<512> >& messages,
+                           hls::stream<RePerfEvent>& perf_events) {
+    while (true) {
+        ReMappedPacket mapped = mapped_packets.read();
+        ReCapturedPacket packet = captured_packets.read();
+        bool valid = mapped.valid && packet.valid &&
+                     mapped.message_id == packet.message_id &&
+                     mapped.address == packet.address;
+
+        RePerfEvent event;
+        event.flags = valid ? RE_PERF_PACKET_READY : 0;
+        event.message_id = mapped.message_id;
+        event.job_id = mapped.job_id;
+        event.pu = 0;
+        event.message_bytes = packet.length;
+        event.rule_bytes = mapped.rule_bytes;
+        event.dma_beats = packet.beats;
+        if (valid) perf_events.write_nb(event);
+
+        if (valid) {
+            ReStreamJob job;
+            job.length = packet.length;
+            job.beats = packet.beats;
+            job.rule = mapped.job_id.range(3, 0);
+            job.rule_bytes = mapped.rule_bytes;
+            job.groups = mapped.groups;
+            job.address = packet.address;
+            job.message_id = packet.message_id;
+            jobs.write(job);
+        }
+
+        for (int i = 0; i < packet.beats; ++i) {
+#pragma HLS pipeline II=1
+            ap_uint<512> word = captured_words.read();
+            if (valid) messages.write(word);
+        }
+
+        if (valid) {
+            event.flags = RE_PERF_HANDOFF_DONE;
+            perf_events.write_nb(event);
+        }
+        packet_completions.write(true);
     }
 }
 
@@ -504,6 +731,22 @@ extern "C" void reEngineKernel(
 #pragma HLS stream variable=rule_updates depth=2
     hls::stream<bool> rule_update_done("rule_update_done");
 #pragma HLS stream variable=rule_update_done depth=2
+    hls::stream<ap_uint<1> > capture_enable_commands(
+        "capture_enable_commands");
+#pragma HLS stream variable=capture_enable_commands depth=2
+    hls::stream<bool> capture_quiesced_events("capture_quiesced_events");
+#pragma HLS stream variable=capture_quiesced_events depth=2
+    hls::stream<RePacketStart> packet_starts("packet_starts");
+#pragma HLS stream variable=packet_starts depth=64
+    hls::stream<ReCapturedPacket> captured_packets("captured_packets");
+#pragma HLS stream variable=captured_packets depth=64
+    hls::stream<ap_uint<512> > captured_words("captured_words");
+#pragma HLS stream variable=captured_words depth=2048
+#pragma HLS bind_storage variable=captured_words type=fifo impl=bram
+    hls::stream<ReMappedPacket> mapped_packets("mapped_packets");
+#pragma HLS stream variable=mapped_packets depth=64
+    hls::stream<bool> packet_completions("packet_completions");
+#pragma HLS stream variable=packet_completions depth=64
     hls::stream<ReStreamJob> jobs("jobs");
 #pragma HLS stream variable=jobs depth=64
     hls::stream<ap_uint<512> > messages("messages");
@@ -514,19 +757,30 @@ extern "C" void reEngineKernel(
     hls::stream<ap_uint<32> > output_words("output_words");
 #pragma HLS stream variable=output_words depth=1024
 #pragma HLS bind_storage variable=output_words type=fifo impl=bram
-    hls::stream<RePerfEvent> ingress_perf_events("ingress_perf_events");
-#pragma HLS stream variable=ingress_perf_events depth=64
+    hls::stream<RePerfEvent> capture_perf_events("capture_perf_events");
+#pragma HLS stream variable=capture_perf_events depth=128
+    hls::stream<RePerfEvent> lookup_perf_events("lookup_perf_events");
+#pragma HLS stream variable=lookup_perf_events depth=128
+    hls::stream<RePerfEvent> join_perf_events("join_perf_events");
+#pragma HLS stream variable=join_perf_events depth=128
     hls::stream<RePerfRecord> perf_records("perf_records");
 #pragma HLS stream variable=perf_records depth=128
 #pragma HLS bind_storage variable=perf_records type=fifo impl=bram
 
-    re_stream_ingress(dma_in, cfg_in, cfg_out,
-                      rule_updates, rule_update_done, jobs, messages,
-                      ingress_perf_events);
+    re_dma_capture(dma_in, capture_enable_commands,
+                   capture_quiesced_events, packet_starts,
+                   captured_packets, captured_words, capture_perf_events);
+    re_config_lookup(cfg_in, cfg_out, capture_enable_commands,
+                     capture_quiesced_events, packet_starts, mapped_packets,
+                     packet_completions, rule_updates, rule_update_done,
+                     lookup_perf_events);
+    re_packet_join(mapped_packets, captured_packets, captured_words,
+                   packet_completions, jobs, messages, join_perf_events);
     re_streaming::engine<RE_PU_NM>(rule_updates, rule_update_done,
                                    jobs, messages,
                                    output_order, output_words,
-                                   ingress_perf_events, perf_records);
+                                   capture_perf_events, lookup_perf_events,
+                                   join_perf_events, perf_records);
     re_stream_egress(result_in, result_out, output_order, output_words);
     re_perf_egress(perf_records, perf_out);
 #else

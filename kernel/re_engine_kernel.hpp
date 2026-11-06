@@ -105,7 +105,7 @@ struct match_out {
 //   [203:164] rule lookup cycle    [243:204] packet-ready cycle
 //   [283:244] dispatch cycle       [323:284] PU input-start cycle
 //   [363:324] VM compute-start     [403:364] VM compute-done
-//   [443:404] ordered-result-ready [459:444] DMA beat count
+//   [443:404] result-buffered cycle [459:444] DMA beat count
 //   [475:460] correlator drops     [511:476] reserved
 //
 // Engine snapshot (type = 2), emitted after each message record

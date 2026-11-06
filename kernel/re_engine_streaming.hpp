@@ -24,6 +24,14 @@ struct ReStreamOrder {
     ap_uint<32> message_id;
 };
 
+// Scheduling and payload movement are deliberately separate. The scheduler
+// can reserve several free PUs without waiting for an earlier payload to be
+// copied, while the router preserves packet order on the shared message FIFO.
+struct ReStreamAssignment {
+    ap_uint<8> pu;
+    ap_uint<9> beats;
+};
+
 enum RePerfEventKind {
     RE_PERF_DMA_SOP       = 1 << 0,
     RE_PERF_IOVA_DONE     = 1 << 1,
@@ -144,13 +152,12 @@ void broadcastRuleUpdates(hls::stream<ReRuleUpdate>& updates,
 }
 
 template <int PU_NM>
-void dispatchMsgByFreePU(hls::stream<ReStreamJob>& jobs,
-                         hls::stream<ap_uint<512> >& messages,
-                         hls::stream<bool> done[PU_NM],
-                         hls::stream<ReStreamJob> pu_jobs[PU_NM],
-                         hls::stream<ap_uint<512> > pu_messages[PU_NM],
-                         hls::stream<ReStreamOrder>& order,
-                         hls::stream<RePerfEvent>& perf_events) {
+void dispatchJobsByFreePU(hls::stream<ReStreamJob>& jobs,
+                          hls::stream<bool> done[PU_NM],
+                          hls::stream<ReStreamJob> pu_jobs[PU_NM],
+                          hls::stream<ReStreamAssignment>& assignments,
+                          hls::stream<ReStreamOrder>& order,
+                          hls::stream<RePerfEvent>& perf_events) {
     bool free_map[PU_NM];
 #pragma HLS array_partition variable=free_map complete
     for (int p = 0; p < PU_NM; ++p) {
@@ -191,6 +198,11 @@ void dispatchMsgByFreePU(hls::stream<ReStreamJob>& jobs,
         ticket.message_id = job.message_id;
         order.write(ticket);
 
+        ReStreamAssignment assignment;
+        assignment.pu = selected;
+        assignment.beats = job.beats;
+        assignments.write(assignment);
+
         RePerfEvent perf_event;
         perf_event.flags = RE_PERF_DISPATCH;
         perf_event.message_id = job.message_id;
@@ -204,12 +216,24 @@ void dispatchMsgByFreePU(hls::stream<ReStreamJob>& jobs,
 #pragma HLS unroll
             if (selected == p) pu_jobs[p].write(job);
         }
-        for (int i = 0; i < job.beats; ++i) {
+    }
+}
+
+// Move payloads independently of scheduling. Deep per-PU FIFOs let this
+// router finish one packet at one 512-bit beat per clock even while a PU is
+// still unpacking an earlier beat into its 32-bit VM memory.
+template <int PU_NM>
+void routeMessagesByPU(hls::stream<ReStreamAssignment>& assignments,
+                       hls::stream<ap_uint<512> >& messages,
+                       hls::stream<ap_uint<512> > pu_messages[PU_NM]) {
+    while (true) {
+        ReStreamAssignment assignment = assignments.read();
+        for (int i = 0; i < assignment.beats; ++i) {
 #pragma HLS pipeline II=1
             ap_uint<512> beat = messages.read();
             for (int p = 0; p < PU_NM; ++p) {
 #pragma HLS unroll
-                if (selected == p) pu_messages[p].write(beat);
+                if (assignment.pu == p) pu_messages[p].write(beat);
             }
         }
     }
@@ -221,6 +245,7 @@ void processingUnit(hls::stream<ReRuleUpdate>& rule_updates,
                     hls::stream<ReStreamJob>& jobs,
                     hls::stream<ap_uint<512> >& messages,
                     hls::stream<ap_uint<32> >& results,
+                    hls::stream<ReStreamOrder>& completed_jobs,
                     hls::stream<bool>& done,
                     ap_uint<8> pu_id,
                     hls::stream<RePerfEvent>& perf_events) {
@@ -278,6 +303,12 @@ void processingUnit(hls::stream<ReRuleUpdate>& rule_updates,
                 result.range(31, 16) = offsets[2 * g + 2];
                 results.write(result);
             }
+            ReStreamOrder completed;
+            completed.pu = pu_id;
+            completed.groups = job.groups;
+            completed.address = job.address;
+            completed.message_id = job.message_id;
+            completed_jobs.write(completed);
             perf_event.flags = RE_PERF_PU_DONE;
             perf_events.write_nb(perf_event);
             // The VM and result copy have finished; the PU's message and
@@ -294,41 +325,134 @@ void processingUnits(hls::stream<ReRuleUpdate> rule_updates[PU_NM],
                      hls::stream<ReStreamJob> jobs[PU_NM],
                      hls::stream<ap_uint<512> > messages[PU_NM],
                      hls::stream<ap_uint<32> > results[PU_NM],
+                     hls::stream<ReStreamOrder> completed_jobs[PU_NM],
                      hls::stream<bool> done[PU_NM],
                      hls::stream<RePerfEvent> perf_events[PU_NM]) {
     for (int p = 0; p < PU_NM; ++p) {
 #pragma HLS unroll
         processingUnit<RE_CPGP_NM, RE_MSG_LEN, RE_STACK_SIZE>(
             rule_updates[p], rule_update_done[p], jobs[p], messages[p],
-            results[p], done[p], p, perf_events[p]);
+            results[p], completed_jobs[p], done[p], p, perf_events[p]);
+    }
+}
+
+template <int PU_NM>
+void mergeCompletedJobs(hls::stream<ReStreamOrder> completed_jobs[PU_NM],
+                        hls::stream<ReStreamOrder>& merged_completions) {
+    while (true) {
+        bool found = false;
+        ReStreamOrder completed;
+        for (int p = 0; p < PU_NM; ++p) {
+#pragma HLS unroll
+            ReStreamOrder candidate;
+            if (!found && completed_jobs[p].read_nb(candidate)) {
+                completed = candidate;
+                found = true;
+            }
+        }
+        if (found) merged_completions.write(completed);
     }
 }
 
 template <int PU_NM>
 void collectResults(hls::stream<ReStreamOrder>& order,
                     hls::stream<ap_uint<32> > results[PU_NM],
+                    hls::stream<ReStreamOrder>& completed_jobs,
                     hls::stream<ReStreamOrder>& output_order,
                     hls::stream<ap_uint<32> >& output_words,
                     hls::stream<RePerfEvent>& perf_events) {
+    const int SLOT_NM = 64;
+    const int WORD_NM = RE_CPGP_NM + 1;
+    static ap_uint<32> result_buffer[SLOT_NM][WORD_NM];
+#pragma HLS bind_storage variable=result_buffer type=ram_t2p impl=uram
+    static ap_uint<32> slot_id[SLOT_NM];
+    static ap_uint<1> slot_valid[SLOT_NM];
+#pragma HLS dependence variable=slot_id inter false
+#pragma HLS dependence variable=slot_valid inter false
+
+    static ap_uint<1> capture_active = 0;
+    static ReStreamOrder capture_ticket;
+    static ap_uint<10> capture_index = 0;
+
+    static ap_uint<1> retire_active = 0;
+    static ap_uint<1> retire_header_sent = 0;
+    static ReStreamOrder retire_ticket;
+    static ap_uint<10> retire_index = 0;
+
     while (true) {
-        ReStreamOrder ticket = order.read();
-        output_order.write(ticket);
-        for (int i = 0; i < ticket.groups + 1; ++i) {
 #pragma HLS pipeline II=1
-            for (int p = 0; p < PU_NM; ++p) {
-#pragma HLS unroll
-                if (ticket.pu == p) output_words.write(results[p].read());
+        if (!capture_active) {
+            ReStreamOrder completed;
+            if (completed_jobs.read_nb(completed)) {
+                capture_ticket = completed;
+                capture_index = 0;
+                capture_active = 1;
             }
         }
-        RePerfEvent perf_event;
-        perf_event.flags = 0;
-        perf_event.message_id = ticket.message_id;
-        perf_event.job_id = 0;
-        perf_event.pu = ticket.pu;
-        perf_event.message_bytes = 0;
-        perf_event.rule_bytes = 0;
-        perf_event.dma_beats = 0;
-        perf_events.write_nb(perf_event);
+
+        if (capture_active) {
+            ap_uint<32> word;
+            bool got_word = false;
+            for (int p = 0; p < PU_NM; ++p) {
+#pragma HLS unroll
+                if (capture_ticket.pu == p && results[p].read_nb(word))
+                    got_word = true;
+            }
+            if (got_word) {
+                ap_uint<6> slot = capture_ticket.message_id.range(5, 0);
+                result_buffer[slot][capture_index] = word;
+                if (capture_index == capture_ticket.groups) {
+                    slot_id[slot] = capture_ticket.message_id;
+                    slot_valid[slot] = 1;
+                    capture_active = 0;
+
+                    // This timestamp describes availability in the internal
+                    // reorder buffer, independently of an older MMIO result.
+                    RePerfEvent perf_event;
+                    perf_event.flags = 0;
+                    perf_event.message_id = capture_ticket.message_id;
+                    perf_event.job_id = 0;
+                    perf_event.pu = capture_ticket.pu;
+                    perf_event.message_bytes = 0;
+                    perf_event.rule_bytes = 0;
+                    perf_event.dma_beats = 0;
+                    perf_events.write_nb(perf_event);
+                } else {
+                    capture_index++;
+                }
+            }
+        }
+
+        if (!retire_active) {
+            ReStreamOrder ticket;
+            if (order.read_nb(ticket)) {
+                retire_ticket = ticket;
+                retire_index = 0;
+                retire_header_sent = 0;
+                retire_active = 1;
+            }
+        }
+
+        if (retire_active) {
+            ap_uint<6> slot = retire_ticket.message_id.range(5, 0);
+            bool ready = slot_valid[slot] &&
+                         slot_id[slot] == retire_ticket.message_id;
+            if (ready && !retire_header_sent) {
+                if (output_order.write_nb(retire_ticket))
+                    retire_header_sent = 1;
+            } else if (ready && retire_header_sent) {
+                ap_uint<32> word = result_buffer[slot][retire_index];
+                if (output_words.write_nb(word)) {
+                    if (retire_index == retire_ticket.groups) {
+                        slot_valid[slot] = 0;
+                        retire_active = 0;
+                        retire_header_sent = 0;
+                    } else {
+                        retire_index++;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -337,11 +461,15 @@ void collectResults(hls::stream<ReStreamOrder>& order,
 // events carry the cycle at which they occurred.
 template <int PU_NM>
 void timestampPerformanceEvents(
-        hls::stream<RePerfEvent>& ingress_events,
+        hls::stream<RePerfEvent>& capture_events,
+        hls::stream<RePerfEvent>& lookup_events,
+        hls::stream<RePerfEvent>& join_events,
         hls::stream<RePerfEvent>& dispatch_events,
         hls::stream<RePerfEvent> pu_events[PU_NM],
         hls::stream<RePerfEvent>& result_events,
-        hls::stream<ReTimedPerfEvent>& timed_ingress_events,
+        hls::stream<ReTimedPerfEvent>& timed_capture_events,
+        hls::stream<ReTimedPerfEvent>& timed_lookup_events,
+        hls::stream<ReTimedPerfEvent>& timed_join_events,
         hls::stream<ReTimedPerfEvent>& timed_dispatch_events,
         hls::stream<ReTimedPerfEvent> timed_pu_events[PU_NM],
         hls::stream<ReTimedPerfEvent>& timed_result_events,
@@ -385,7 +513,7 @@ void timestampPerformanceEvents(
 
         RePerfEvent event;
         ReTimedPerfEvent timed;
-        if (ingress_events.read_nb(event)) {
+        if (capture_events.read_nb(event)) {
             // Exclude rule/IOVA configuration time from utilization. The first
             // DMA SOP marks the beginning of the measured workload window.
             if (!measurement_active && (event.flags & RE_PERF_DMA_SOP)) {
@@ -398,7 +526,17 @@ void timestampPerformanceEvents(
             }
             timed.event = event;
             timed.cycle = now;
-            timed_ingress_events.write_nb(timed);
+            timed_capture_events.write_nb(timed);
+        }
+        if (lookup_events.read_nb(event)) {
+            timed.event = event;
+            timed.cycle = now;
+            timed_lookup_events.write_nb(timed);
+        }
+        if (join_events.read_nb(event)) {
+            timed.event = event;
+            timed.cycle = now;
+            timed_join_events.write_nb(timed);
         }
         if (dispatch_events.read_nb(event)) {
             timed.event = event;
@@ -450,7 +588,9 @@ void timestampPerformanceEvents(
 // Correlate already-timestamped milestones. All streams are diagnostic taps,
 // so this formatter has no backpressure path into matching.
 template <int PU_NM>
-void monitorPerformance(hls::stream<ReTimedPerfEvent>& ingress_events,
+void monitorPerformance(hls::stream<ReTimedPerfEvent>& capture_events,
+                        hls::stream<ReTimedPerfEvent>& lookup_events,
+                        hls::stream<ReTimedPerfEvent>& join_events,
                         hls::stream<ReTimedPerfEvent>& dispatch_events,
                         hls::stream<ReTimedPerfEvent> pu_events[PU_NM],
                         hls::stream<ReTimedPerfEvent>& result_events,
@@ -497,7 +637,7 @@ void monitorPerformance(hls::stream<ReTimedPerfEvent>& ingress_events,
     while (true) {
         ReTimedPerfEvent timed_event;
         RePerfEvent event;
-        if (ingress_events.read_nb(timed_event)) {
+        if (capture_events.read_nb(timed_event)) {
             event = timed_event.event;
             ap_uint<40> now = timed_event.cycle.range(39, 0);
             ap_uint<6> slot = event.message_id.range(5, 0);
@@ -526,6 +666,12 @@ void monitorPerformance(hls::stream<ReTimedPerfEvent>& ingress_events,
                     compute_done_valid[p][slot] = 0;
                 }
             }
+        }
+
+        if (lookup_events.read_nb(timed_event)) {
+            event = timed_event.event;
+            ap_uint<40> now = timed_event.cycle.range(39, 0);
+            ap_uint<6> slot = event.message_id.range(5, 0);
             if (slot_valid[slot] && slot_id[slot] == event.message_id) {
                 if (event.flags & RE_PERF_IOVA_DONE) iova_cycle[slot] = now;
                 if (event.flags & RE_PERF_RULE_DONE) {
@@ -533,14 +679,21 @@ void monitorPerformance(hls::stream<ReTimedPerfEvent>& ingress_events,
                     slot_job[slot] = event.job_id;
                     slot_rule_bytes[slot] = event.rule_bytes;
                 }
+            }
+        }
+
+        if (join_events.read_nb(timed_event)) {
+            event = timed_event.event;
+            ap_uint<40> now = timed_event.cycle.range(39, 0);
+            ap_uint<6> slot = event.message_id.range(5, 0);
+            if (slot_valid[slot] && slot_id[slot] == event.message_id) {
                 if (event.flags & RE_PERF_PACKET_READY) {
                     ready_cycle[slot] = now;
                     slot_length[slot] = event.message_bytes;
                     slot_beats[slot] = event.dma_beats;
                 }
-                if (event.flags & RE_PERF_HANDOFF_DONE) {
+                if (event.flags & RE_PERF_HANDOFF_DONE)
                     ingress_handoff_cycles += now - ready_cycle[slot];
-                }
             }
         }
 
@@ -681,7 +834,9 @@ void engine(hls::stream<ReRuleUpdate>& rule_updates,
             hls::stream<ap_uint<512> >& messages,
             hls::stream<ReStreamOrder>& output_order,
             hls::stream<ap_uint<32> >& output_words,
-            hls::stream<RePerfEvent>& ingress_perf_events,
+            hls::stream<RePerfEvent>& capture_perf_events,
+            hls::stream<RePerfEvent>& lookup_perf_events,
+            hls::stream<RePerfEvent>& join_perf_events,
             hls::stream<RePerfRecord>& perf_out) {
 #pragma HLS dataflow disable_start_propagation
     hls::stream<ReRuleUpdate> pu_rule_updates[PU_NM];
@@ -691,22 +846,36 @@ void engine(hls::stream<ReRuleUpdate>& rule_updates,
     hls::stream<ReStreamJob> pu_jobs[PU_NM];
 #pragma HLS stream variable=pu_jobs depth=2
     hls::stream<ap_uint<512> > pu_messages[PU_NM];
-#pragma HLS stream variable=pu_messages depth=8
+#pragma HLS stream variable=pu_messages depth=128
+#pragma HLS bind_storage variable=pu_messages type=fifo impl=bram
     hls::stream<ap_uint<32> > pu_results[PU_NM];
-#pragma HLS stream variable=pu_results depth=1024
+#pragma HLS stream variable=pu_results depth=2048
 #pragma HLS bind_storage variable=pu_results type=fifo impl=bram
+    hls::stream<ReStreamOrder> completed_jobs[PU_NM];
+#pragma HLS stream variable=completed_jobs depth=16
+    hls::stream<ReStreamOrder> merged_completions;
+#pragma HLS stream variable=merged_completions depth=64
     hls::stream<bool> done[PU_NM];
 #pragma HLS stream variable=done depth=2
     hls::stream<ReStreamOrder> order;
-#pragma HLS stream variable=order depth=64
+    // The collector may hold one retiring ticket outside this FIFO. Limiting
+    // the queued remainder to 63 keeps total in-flight order/reorder slots at
+    // 64, so the low-six-bit tagged result slots cannot alias before reuse.
+#pragma HLS stream variable=order depth=63
+    hls::stream<ReStreamAssignment> assignments;
+#pragma HLS stream variable=assignments depth=64
     hls::stream<RePerfEvent> dispatch_perf_events;
 #pragma HLS stream variable=dispatch_perf_events depth=64
     hls::stream<RePerfEvent> pu_perf_events[PU_NM];
 #pragma HLS stream variable=pu_perf_events depth=8
     hls::stream<RePerfEvent> result_perf_events;
 #pragma HLS stream variable=result_perf_events depth=64
-    hls::stream<ReTimedPerfEvent> timed_ingress_perf_events;
-#pragma HLS stream variable=timed_ingress_perf_events depth=128
+    hls::stream<ReTimedPerfEvent> timed_capture_perf_events;
+#pragma HLS stream variable=timed_capture_perf_events depth=128
+    hls::stream<ReTimedPerfEvent> timed_lookup_perf_events;
+#pragma HLS stream variable=timed_lookup_perf_events depth=128
+    hls::stream<ReTimedPerfEvent> timed_join_perf_events;
+#pragma HLS stream variable=timed_join_perf_events depth=128
     hls::stream<ReTimedPerfEvent> timed_dispatch_perf_events;
 #pragma HLS stream variable=timed_dispatch_perf_events depth=128
     hls::stream<ReTimedPerfEvent> timed_pu_perf_events[PU_NM];
@@ -719,20 +888,26 @@ void engine(hls::stream<ReRuleUpdate>& rule_updates,
 
     broadcastRuleUpdates<PU_NM>(rule_updates, rule_update_done,
                                 pu_rule_updates, pu_rule_update_done);
-    dispatchMsgByFreePU<PU_NM>(jobs, messages, done, pu_jobs, pu_messages,
-                               order, dispatch_perf_events);
+    dispatchJobsByFreePU<PU_NM>(jobs, done, pu_jobs, assignments, order,
+                                dispatch_perf_events);
+    routeMessagesByPU<PU_NM>(assignments, messages, pu_messages);
     processingUnits<PU_NM>(pu_rule_updates, pu_rule_update_done,
-                           pu_jobs, pu_messages, pu_results, done,
+                           pu_jobs, pu_messages, pu_results, completed_jobs,
+                           done,
                            pu_perf_events);
-    collectResults<PU_NM>(order, pu_results, output_order, output_words,
-                          result_perf_events);
+    mergeCompletedJobs<PU_NM>(completed_jobs, merged_completions);
+    collectResults<PU_NM>(order, pu_results, merged_completions, output_order,
+                          output_words, result_perf_events);
     timestampPerformanceEvents<PU_NM>(
-        ingress_perf_events, dispatch_perf_events, pu_perf_events,
-        result_perf_events, timed_ingress_perf_events,
+        capture_perf_events, lookup_perf_events, join_perf_events,
+        dispatch_perf_events, pu_perf_events, result_perf_events,
+        timed_capture_perf_events, timed_lookup_perf_events,
+        timed_join_perf_events,
         timed_dispatch_perf_events, timed_pu_perf_events,
         timed_result_perf_events, perf_counter_snapshots);
     monitorPerformance<PU_NM>(
-        timed_ingress_perf_events, timed_dispatch_perf_events,
+        timed_capture_perf_events, timed_lookup_perf_events,
+        timed_join_perf_events, timed_dispatch_perf_events,
         timed_pu_perf_events, timed_result_perf_events,
         perf_counter_snapshots, perf_out);
 }

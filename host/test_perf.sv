@@ -110,7 +110,7 @@ module test_perf;
       in_dma_stall <= 0;
       if (dma_stall_intervals_logged < 16) begin
         $fdisplay(engine_log,
-          "DMA_STALL start=%0d end=%0d cycles=%0d cause=kernel_input_backpressure",
+          "DMA_STALL start=%0d end=%0d cycles=%0d cause=packet_boundary_or_queue_backpressure",
           stall_start, sim_cycle, sim_cycle - stall_start);
         dma_stall_intervals_logged <= dma_stall_intervals_logged + 1;
       end else if (dma_stall_intervals_logged == 16) begin
@@ -161,11 +161,12 @@ module test_perf;
           perf_tdata[475:452], perf_tdata[491:476],
           perf_tdata[507:492]);
       end
+      $fflush(engine_log);
     end
   end
 
   initial begin
-    repeat (250000000) @(posedge clk);
+    repeat (500000) @(posedge clk);
     $fatal(1, "Performance RTL watchdog expired");
   end
 
@@ -405,7 +406,7 @@ module test_perf;
 
     if (in_dma_stall)
       $fdisplay(engine_log,
-        "DMA_STALL start=%0d end=%0d cycles=%0d cause=kernel_input_backpressure",
+        "DMA_STALL start=%0d end=%0d cycles=%0d cause=packet_boundary_or_queue_backpressure",
         stall_start, sim_cycle, sim_cycle - stall_start);
     $fdisplay(engine_log,
       "DMA_SUMMARY stall_events=%0d stall_cycles=%0d average_interval=%0d interface_condition=TVALID&&!TREADY",
@@ -415,7 +416,7 @@ module test_perf;
       "ENGINE_SUMMARY all_busy=%0d ingress_handoff=%0d scheduler_wait=%0d",
       last_all_busy, last_ingress_handoff, last_scheduler_wait);
     $fdisplay(engine_log,
-      "INTERPRETATION repeated per-beat stalls expose ingress service interval; scheduler_wait with all_busy=0 exposes serialized dispatcher payload forwarding; nonzero all_busy exposes PU saturation; per-PU idle counters show load balance.");
+      "INTERPRETATION short DMA stalls occur at packet-boundary descriptor handling or queue backpressure; scheduler_wait indicates PU availability; result timing is internal reorder-buffer arrival; all_busy and per-PU idle counters show saturation and load balance.");
     $fclose(message_log);
     $fclose(engine_log);
     $fclose(workload_log);

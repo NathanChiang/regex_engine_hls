@@ -72,15 +72,24 @@ inputs, `perf_message_results.log` records returned words without checking
 them, and `perf_engine.log` contains timing, utilization, and DMA-stall data.
 
 Per-message records separate IOVA lookup, chained rule lookup, packet/lookup
-join, ready-to-dispatch scheduling, PU input/load, VM execution, and ordered
-result wait. Engine snapshots contain all 16 synthesized PU-idle counters and
-all-PUs-busy cycles measured from the first DMA SOP, actual internal
+join, ready-to-dispatch scheduling, PU input/load, VM execution, and internal
+result-buffer arrival. Engine snapshots contain all 16 synthesized PU-idle
+counters and all-PUs-busy cycles measured from the first DMA SOP, actual internal
 packet-handoff cycles (including FIFO backpressure), and cumulative scheduling
 delay. The testbench independently
 counts every interface `TVALID && !TREADY` cycle. Correlating those intervals
 with handoff, all-busy, and scheduler counters identifies ingress-copy pressure
-versus processing saturation. The current chained rule-metadata lookup can
-correctly measure zero cycles after IOVA completion.
+versus processing saturation. Short residual DMA stalls can occur while a
+packet-boundary descriptor is committed; packet bodies are accepted by an
+`II=1` capture loop. The current chained rule-metadata lookup can correctly
+measure zero cycles after IOVA completion.
+
+Scheduling, payload routing, and result retirement are separate dataflow
+processes. The scheduler may reserve another free PU while the 512-bit payload
+router is still moving an earlier packet. Each PU has a deep payload/result
+queue, and completed results enter a tagged URAM reorder buffer. This prevents
+an older slow job or delayed MMIO acknowledgement from blocking unrelated PU
+completion while preserving the original externally ordered result stream.
 
 Telemetry leaves through the dedicated 512-bit `perf_out` AXI4-Stream. Its
 record layout is documented beside `RePerfRecord` in
@@ -103,9 +112,10 @@ keeps it asserted. Up to 64 messages may be in flight.
   VM workers. Each accepted packet carries a four-bit rule index. Instruction
   and bitset storage is replicated once per PU, so all sixteen VMs can read
   their selected rules concurrently without copying rule payloads per message.
-  Configuration writes update all replicas in parallel. Input, dispatch,
-  execution, and ordered result delivery run concurrently. Do not rewrite or
-  delete rules while packets using them are in flight. The AXIS input honors
+  Configuration writes update all replicas in parallel. DMA capture, lookup,
+  payload routing, execution, result buffering, and ordered result delivery run
+  concurrently. Do not rewrite or delete rules while packets using them are in
+  flight. The AXIS input honors
   backpressure; a passive snoop source still needs external buffering or a
   defined drop policy when the queue fills.
 - Pending MMIO results do not raise `result_out.halt` in streaming hardware;

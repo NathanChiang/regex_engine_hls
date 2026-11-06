@@ -1,7 +1,8 @@
 # VCK190 / Vitis HLS 2021.2 verification
 
 This target is a standalone Vivado IP with AXI-Lite configuration/results and
-AXI4-Stream DMA input, targeting `xcvc1902-vsva2197-2MP-e-S` at a 9 ns clock.
+AXI4-Stream DMA input, targeting `xcvc1902-vsva2197-2MP-e-S` at a 4 ns
+(250 MHz) clock, with the default HLS clock uncertainty retained.
 The legacy Alveo OpenCL host path and `conn_u*.cfg` files do not connect this
 interface. Integrate the exported IP in the VCK190 PL design.
 
@@ -24,6 +25,9 @@ RE_HLS_ACTION=cosim_only RE_HLS_COSIM_LINES=1000 vitis_hls -f run_hls.tcl # reus
 
 # Start-once production RTL, including AXI-Lite bus transactions:
 RE_HLS_RTL_PROJECT=re_engine_direct_array_status python3 run_rtl_mmio.py
+
+# Completion-order, burst/backpressure, and maximum-capture RTL regression:
+RE_HLS_RTL_PROJECT=re_engine_direct RE_HLS_RTL_BENCH=streaming python3 run_rtl_mmio.py
 
 # Original log-data/Oniguruma reference comparison (Linux libraries required):
 RE_HLS_ACTION=csim RE_HLS_TESTBENCH=log vitis_hls -f run_hls.tcl
@@ -67,16 +71,37 @@ one project. Use a clean project if changing tool versions.
   VM workers. Each accepted packet carries a four-bit rule index. Instruction
   and bitset storage is replicated once per PU, so all sixteen VMs can read
   their selected rules concurrently without copying rule payloads per message.
-  Configuration writes update all replicas in parallel. Input, dispatch,
-  execution, and ordered result delivery run concurrently. Do not rewrite or
+  Configuration writes update all replicas in parallel. DMA capture, lookup,
+  scheduling, payload routing, execution, and result delivery run concurrently.
+  DMA packet bodies are captured with II=1 independently of AXI-Lite polling.
+  Scheduling reserves a free PU independently of the payload router; a full
+  64-beat packet fits in each PU's input FIFO, avoiding backpressure from the
+  VM's narrower message-memory loader. Do not rewrite or
   delete rules while packets using them are in flight. The AXIS input honors
   backpressure; a passive snoop source still needs external buffering or a
   defined drop policy when the queue fills.
 - Pending MMIO results do not raise `result_out.halt` in streaming hardware;
   AXIS `TREADY` supplies input backpressure when necessary.
-- `regexVM_opt` pipelines VM loop iterations at II=3; it does not expose three
-  independent message slots. A PU is reusable only after its VM call and
-  result copy finish, so its message and capture buffers are no longer in use.
+- Results are returned in completion order rather than input serial order.
+  Each PU announces a job only after its complete result record is buffered.
+  A fair arbiter selects ready records and queues their completion tickets;
+  it never waits for an unfinished earlier job. Records with multiple chunks
+  remain contiguous. If several PUs are pending, round-robin arbitration
+  resolves their order. Finite queues still propagate backpressure when
+  software stops consuming results. No serial-number reorder buffer is used.
+- Every result chunk carries a 32-bit `message_id` at MMIO `0xcc` in addition
+  to the existing DMA address. The sequence starts at zero after hardware
+  reset, advances for each SOP packet (including packets subsequently dropped),
+  and wraps at 2^32. CLEAR does not restart it. Use the ID to associate results
+  when DMA addresses repeat; software must no longer assume arrival order.
+  This one sequence counter replaces the measure branch's large diagnostic
+  event/counter pipeline. The AXIS and AXI-Lite ports are otherwise unchanged.
+- `regexVM_opt` lets HLS choose the pipeline II to meet the clock target;
+  the 4 ns Vitis HLS 2021.2 build achieves II=6. Completion arbitration
+  achieves II=3 to register its feedback path. These intervals trade execution
+  throughput for shorter clock stages; DMA packet bodies still achieve II=1.
+  A PU is reusable only after its VM call and result copy finish, so its message
+  and capture buffers are no longer in use.
 - In hardware, start the AXI-Lite-controlled kernel once (`ap_ctrl_hs`) after
   reset. It then runs continuously. Configuration and result-acknowledgement
   MMIO inputs are reread while it runs; software must not wait for `ap_done`.
@@ -94,7 +119,8 @@ one project. Use a clean project if changing tool versions.
   tables. Control state resets explicitly; data memories are invalidated by
   CLEAR instead of a large synchronous RAM reset. CLEAR takes 1025 table
   steps. A worst-case insertion needs a directory scan and two bucket passes;
-  the C test allows 4096 steps.
+  the C test allows 4096 steps. Deletion registers its exact-range comparison
+  before updating the scan/control state, taking two steps per directory entry.
 - Configure with `valid=0` while selecting a command and filling its arguments,
   then assert `valid`. Hold all fields until `ack` or `full`; completion is
   held until `valid` is lowered. Wait for acknowledgement to clear and
@@ -123,10 +149,10 @@ one project. Use a clean project if changing tool versions.
   each snapshot locally before publishing it.
 
 The interface changes require regenerating the AXI-Lite driver/register map.
-For the supplied 2021.2 Vivado flow, `cfg_in` occupies 0x10..0x24,
-`cfg_out` is at 0x30, and `result_in` is at 0x38. The result payload is at
+For the supplied 2021.2 Vivado flow, `cfg_in` occupies 0x20..0x34,
+`cfg_out` is at 0x10, and `result_in` occupies 0x18..0x1c. The result payload is at
 0x80..0xbc, the address at 0xc0..0xc4, and ack/valid/halt occupy consecutive
-bytes at 0xc8. `cfg_in` packs command/valid/job into bytes 0/1/2..3, then
+bytes at 0xc8; `message_id` is at 0xcc. `cfg_in` packs command/valid/job into bytes 0/1/2..3, then
 aligns the two 64-bit arguments at bytes 8 and 16. Read the generated map
 when integrating; do not cast a native host `ap_uint` struct into MMIO bytes.
 
@@ -146,10 +172,31 @@ This explicit C-reference/RTL flow is required because the start-once
 `ap_ctrl_hs` kernel deliberately never asserts `ap_done`; the standard HLS
 transaction wrapper cannot modify live MMIO registers while waiting for that
 transaction to return. The smaller `tb_mmio.sv` separately checks stable
-result reads and reset with a pending result.
+result reads, IOVA deletion/miss/reuse, and reset with a pending result.
+
+`tb_streaming.sv` checks that a short second job overtakes a long first job,
+then runs 80 messages of 3, 65, and 4088 bytes: 16 maximum-size capture records
+followed by 64 smaller records for multiple PU reuse rounds. It checks every
+result word, ID, address, padding word, and chunk
+boundary while acknowledgements are delayed and held high. Invalid KEEP,
+IOVA-miss, and oversized packets are dropped; a warm reset restarts the ID
+counter. It also requires a sustained run of at least 32 accepted DMA body
+beats at one beat per cycle. Its `streaming_results.csv` and simulator log
+are written under `build/mmio_<project>_streaming/`.
 
 These checks do not establish routed timing, a bitstream, PCIe/NVMe subsystem
 integration, or board operation. HLS resource/timing numbers are estimates.
+
+The Vitis HLS 2021.2 timing run `re_engine_direct_250mhz_registered` reports
+2.920 ns estimated delay at the 4.00 ns target with 1.08 ns clock uncertainty.
+All 27 module reports meet the resulting 2.92 ns scheduling budget, with no
+HLS timing-violation warnings. The previous 6 ns build estimated 6.355 ns.
+The top-level RTL ports and AXI-Lite addresses match that build. The extra
+pipeline stages increase FFs from 76,757 to 95,683 and LUTs from 209,531 to
+212,425; BRAM (786 BRAM_18K) and URAM (48) counts are unchanged.
+The production IOVA/rule C regressions, kernel smoke test, MMIO RTL regression,
+and 80-record streaming RTL regression all passed. The RTL benches use a 4 ns
+clock; the streaming run accepted 61 consecutive DMA body beats at II=1.
 
 The interface choices follow the 2021.2 documentation on
 [AXI stream side channels](https://docs.amd.com/r/2021.2-English/ug1399-vitis-hls/How-AXI4-Stream-is-Implemented)

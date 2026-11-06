@@ -145,7 +145,8 @@ inline void re_engine_iova_table(
         IOVA_CLEAR,
         IOVA_LOOKUP,
         IOVA_WAIT_VALID_LOW,
-        IOVA_WAIT_LOOKUP_VALID_LOW
+        IOVA_WAIT_LOOKUP_VALID_LOW,
+        IOVA_DELETE_CHECK
     };
 
     // Logical directory.  This is not used on the runtime lookup datapath.
@@ -166,6 +167,8 @@ inline void re_engine_iova_table(
 
     // Generic scan index for the logical directory and clear operation.
     static ap_uint<RE_IOVA_INDEX_WIDTH> scan_index = 0;
+    // Register the wide delete comparison before it drives the scan/control FSM.
+    static ap_uint<1> delete_match = 0;
 
     // Latched configuration request.
     static ap_uint<16> req_job_id = 0;
@@ -353,12 +356,16 @@ inline void re_engine_iova_table(
 
     case IOVA_DELETE_FIND: {
         re_iova_entry entry = directory[scan_index];
-        bool match = entry.valid &&
-                     entry.job_id == req_job_id &&
-                     entry.base == req_base &&
-                     entry.limit == req_limit;
+        delete_match = entry.valid &&
+                       entry.job_id == req_job_id &&
+                       entry.base == req_base &&
+                       entry.limit == req_limit;
+        state = IOVA_DELETE_CHECK;
+        break;
+    }
 
-        if (match) {
+    case IOVA_DELETE_CHECK: {
+        if (delete_match) {
             req_map_index = scan_index;
             bucket_offset = 0;
             state = IOVA_DELETE_BUCKETS;
@@ -371,6 +378,7 @@ inline void re_engine_iova_table(
         }
         else {
             scan_index++;
+            state = IOVA_DELETE_FIND;
         }
         break;
     }

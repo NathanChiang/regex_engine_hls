@@ -698,7 +698,9 @@ void regexVM_opt(ap_uint<32>* bitSetBuff,
 #endif
 LOOP_VM:
     while (!end_flag) {
-#pragma HLS pipeline II = 3
+        // Schedule the instruction/bitset/branch feedback for the requested clock.
+        // Fixing II=3 can force the complete branch path into one long cycle.
+#pragma HLS pipeline
 #pragma HLS loop_tripcount min = 1000 max = 1000
 #pragma HLS dependence variable = offsetBuff inter false
 #pragma HLS dependence variable = stack_buff inter false

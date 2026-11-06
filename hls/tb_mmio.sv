@@ -8,7 +8,7 @@ module tb_mmio;
   localparam [15:0] TEST_CPGP_NM = 16'd20;
 `endif
   reg clk = 0;
-  always #4.5 clk = ~clk;
+  always #2 clk = ~clk;
   reg reset_n = 0;
   reg [7:0] awaddr = 0, araddr = 0;
   reg awvalid = 0, wvalid = 0, arvalid = 0;
@@ -121,6 +121,7 @@ module tb_mmio;
     // Payload lives at 0x80; address at 0xc0; ack/valid/halt bytes at 0xc8.
     poll('hc8, 'h00010101, 'h00000100);
     rd('hc0, value); if (value !== 'h1001) $fatal(1, "Wrong result address");
+    rd('hcc, value); if (value !== 0) $fatal(1, "Wrong first message ID");
     for (i = 0; i < 16; i = i + 1) begin
       rd('h80 + i*4, value);
 `ifdef RE_HLS_RTL_QUICK
@@ -151,6 +152,22 @@ module tb_mmio;
     // completes the record instead of revealing another chunk.
     poll('hc8, 'h00010101, 0);
 `endif
+    // Retimed IOVA deletion: remove the active range while another mapping
+    // keeps capture enabled, then verify that the removed range is a miss.
+    command(1, 1, 'h3000, 'h4000);
+    command(2, 1, 'h1000, 'h2000);
+    wr('h20, 0);
+    repeat (128) @(posedge clk);
+    send_packet();
+    repeat (4096) @(posedge clk);
+    rd('hc8, value);
+    if (value[8]) $fatal(1, "Deleted IOVA range still produced a result");
+    // Scan past a hole, then exercise idempotent deletion of a missing range.
+    command(2, 1, 'h3000, 'h4000);
+    command(2, 1, 'h3000, 'h4000);
+    command(1, 1, 'h1000, 'h2000);
+    wr('h20, 0);
+    repeat (128) @(posedge clk);
     // Reset with an outstanding result, clear, and run again.
     send_packet(); poll('hc8, 'h100, 'h100);
     @(negedge clk); reset_n = 0;
@@ -158,7 +175,8 @@ module tb_mmio;
     wr('h00, 1);
     configure(); send_packet(); poll('hc8, 'h00010101, 'h00000100);
     rd('h80, value); if (value !== 1) $fatal(1, "Warm reset recovery failed");
-    $display("PASS production RTL: AXI configuration, DMA sidebands, stable MMIO, held acknowledgements, warm reset");
+    rd('hcc, value); if (value !== 0) $fatal(1, "Warm reset did not restart message IDs");
+    $display("PASS production RTL: AXI configuration, IOVA delete/miss/reuse, DMA sidebands, stable MMIO, held acknowledgements, warm reset");
     $finish;
   end
 endmodule

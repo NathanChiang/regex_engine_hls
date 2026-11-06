@@ -5,7 +5,7 @@
 
 module test_cosim;
   reg clk = 0;
-  always #4.5 clk = ~clk;
+  always #2 clk = ~clk;
 
   reg reset_n = 0;
   reg [7:0] awaddr = 0;

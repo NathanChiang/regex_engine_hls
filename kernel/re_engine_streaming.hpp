@@ -13,12 +13,21 @@ struct ReStreamJob {
     ap_uint<4> rule;
     ap_uint<16> groups;
     ap_uint<64> address;
+    ap_uint<32> message_id;
 };
 
 struct ReStreamOrder {
     ap_uint<8> pu;
     ap_uint<16> groups;
     ap_uint<64> address;
+    ap_uint<32> message_id;
+};
+
+// Scheduling reserves a PU without waiting for payload unpacking. The router
+// consumes these assignments in the same order as the shared payload FIFO.
+struct ReStreamAssignment {
+    ap_uint<8> pu;
+    ap_uint<9> beats;
 };
 
 namespace re_streaming {
@@ -88,12 +97,10 @@ void broadcastRuleUpdates(hls::stream<ReRuleUpdate>& updates,
 }
 
 template <int PU_NM>
-void dispatchMsgByFreePU(hls::stream<ReStreamJob>& jobs,
-                         hls::stream<ap_uint<512> >& messages,
-                         hls::stream<bool> done[PU_NM],
-                         hls::stream<ReStreamJob> pu_jobs[PU_NM],
-                         hls::stream<ap_uint<512> > pu_messages[PU_NM],
-                         hls::stream<ReStreamOrder>& order) {
+void dispatchJobsByFreePU(hls::stream<ReStreamJob>& jobs,
+                          hls::stream<bool> done[PU_NM],
+                          hls::stream<ReStreamJob> pu_jobs[PU_NM],
+                          hls::stream<ReStreamAssignment>& assignments) {
     bool free_map[PU_NM];
 #pragma HLS array_partition variable=free_map complete
     for (int p = 0; p < PU_NM; ++p) {
@@ -127,21 +134,31 @@ void dispatchMsgByFreePU(hls::stream<ReStreamJob>& jobs,
         next = selected + 1;
         if (next == PU_NM) next = 0;
 
-        ReStreamOrder ticket;
-        ticket.pu = selected;
-        ticket.groups = job.groups;
-        ticket.address = job.address;
-        order.write(ticket);
+        ReStreamAssignment assignment;
+        assignment.pu = selected;
+        assignment.beats = job.beats;
+        assignments.write(assignment);
         for (int p = 0; p < PU_NM; ++p) {
 #pragma HLS unroll
             if (selected == p) pu_jobs[p].write(job);
         }
-        for (int i = 0; i < job.beats; ++i) {
+    }
+}
+
+// A whole packet fits in each PU's FIFO. Unpacking 512-bit beats into the VM's
+// 32-bit RAM therefore cannot hold up scheduling or the next packet's routing.
+template <int PU_NM>
+void routeMessagesByPU(hls::stream<ReStreamAssignment>& assignments,
+                       hls::stream<ap_uint<512> >& messages,
+                       hls::stream<ap_uint<512> > pu_messages[PU_NM]) {
+    while (true) {
+        ReStreamAssignment assignment = assignments.read();
+        for (int i = 0; i < assignment.beats; ++i) {
 #pragma HLS pipeline II=1
             ap_uint<512> beat = messages.read();
             for (int p = 0; p < PU_NM; ++p) {
 #pragma HLS unroll
-                if (selected == p) pu_messages[p].write(beat);
+                if (assignment.pu == p) pu_messages[p].write(beat);
             }
         }
     }
@@ -153,7 +170,9 @@ void processingUnit(hls::stream<ReRuleUpdate>& rule_updates,
                     hls::stream<ReStreamJob>& jobs,
                     hls::stream<ap_uint<512> >& messages,
                     hls::stream<ap_uint<32> >& results,
-                    hls::stream<bool>& done) {
+                    hls::stream<ReStreamOrder>& completed_jobs,
+                    hls::stream<bool>& done,
+                    ap_uint<8> pu_id) {
     // A rule is configured once, directly into every PU's private memories.
     // Runtime dispatch passes only the rule index; no rule is copied per job.
     ap_uint<64> instruction_rules[RE_RULE_TABLE_ENTRIES][RE_RULE_INSTR_DEPTH];
@@ -194,6 +213,14 @@ void processingUnit(hls::stream<ReRuleUpdate>& rule_updates,
                 result.range(31, 16) = offsets[2 * g + 2];
                 results.write(result);
             }
+            // Publish only after the complete record is in this PU's FIFO.
+            // The collector never waits for a PU that is still computing.
+            ReStreamOrder completed;
+            completed.pu = pu_id;
+            completed.groups = job.groups;
+            completed.address = job.address;
+            completed.message_id = job.message_id;
+            completed_jobs.write(completed);
             // The VM and result copy have finished; the PU's message and
             // capture buffers are safe to overwrite. A full result record
             // fits in its FIFO.
@@ -208,22 +235,69 @@ void processingUnits(hls::stream<ReRuleUpdate> rule_updates[PU_NM],
                      hls::stream<ReStreamJob> jobs[PU_NM],
                      hls::stream<ap_uint<512> > messages[PU_NM],
                      hls::stream<ap_uint<32> > results[PU_NM],
+                     hls::stream<ReStreamOrder> completed_jobs[PU_NM],
                      hls::stream<bool> done[PU_NM]) {
     for (int p = 0; p < PU_NM; ++p) {
 #pragma HLS unroll
         processingUnit<RE_CPGP_NM, RE_MSG_LEN, RE_STACK_SIZE>(
             rule_updates[p], rule_update_done[p], jobs[p], messages[p],
-            results[p], done[p]);
+            results[p], completed_jobs[p], done[p], p);
+    }
+}
+
+// Only ready records compete for output; no dispatch-order ticket can block
+// a later, faster job. Round-robin arbitration breaks ties fairly. The queue
+// preserves the order in which completions are accepted while MMIO is stalled.
+template <int PU_NM>
+void mergeCompletedJobs(hls::stream<ReStreamOrder> completed_jobs[PU_NM],
+                        hls::stream<ReStreamOrder>& completions) {
+    ap_uint<8> next = 0;
+    while (true) {
+        // Allow registers between round-robin mask/select/encode/advance operations.
+        // A ticket every three clocks is ample for the multi-word result collector.
+#pragma HLS pipeline II=3
+        ap_uint<PU_NM> ready = 0;
+        for (int p = 0; p < PU_NM; ++p) {
+#pragma HLS unroll
+            ready[p] = !completed_jobs[p].empty();
+        }
+        ap_uint<PU_NM> eligible = ready & (ap_uint<PU_NM>(-1) << next);
+        if (eligible == 0) eligible = ready;
+        // Isolate the first ready bit with a small carry chain, rather than
+        // cascading 2*PU_NM conditional priority muxes in the feedback path.
+        ap_uint<PU_NM> grant = eligible & ap_uint<PU_NM>(-eligible);
+        ap_uint<8> selected = 0;
+        for (int bit = 0; bit < 8; ++bit) {
+#pragma HLS unroll
+            ap_uint<PU_NM> mask = 0;
+            for (int p = 0; p < PU_NM; ++p) {
+#pragma HLS unroll
+                mask[p] = (p >> bit) & 1;
+            }
+            selected[bit] = (grant & mask) != 0;
+        }
+        if (grant != 0 && !completions.full()) {
+            ReStreamOrder completed;
+            for (int p = 0; p < PU_NM; ++p) {
+#pragma HLS unroll
+                if (selected == p) completed = completed_jobs[p].read();
+            }
+            // One syntactic write avoids HLS scheduling sixteen potential
+            // writes to the same FIFO port, even though grant is one-hot.
+            completions.write(completed);
+            next = selected + 1;
+            if (next == PU_NM) next = 0;
+        }
     }
 }
 
 template <int PU_NM>
-void collectResults(hls::stream<ReStreamOrder>& order,
+void collectResults(hls::stream<ReStreamOrder>& completions,
                     hls::stream<ap_uint<32> > results[PU_NM],
                     hls::stream<ReStreamOrder>& output_order,
                     hls::stream<ap_uint<32> >& output_words) {
     while (true) {
-        ReStreamOrder ticket = order.read();
+        ReStreamOrder ticket = completions.read();
         output_order.write(ticket);
         for (int i = 0; i < ticket.groups + 1; ++i) {
 #pragma HLS pipeline II=1
@@ -250,21 +324,28 @@ void engine(hls::stream<ReRuleUpdate>& rule_updates,
     hls::stream<ReStreamJob> pu_jobs[PU_NM];
 #pragma HLS stream variable=pu_jobs depth=2
     hls::stream<ap_uint<512> > pu_messages[PU_NM];
-#pragma HLS stream variable=pu_messages depth=8
+#pragma HLS stream variable=pu_messages depth=64
+#pragma HLS bind_storage variable=pu_messages type=fifo impl=bram
     hls::stream<ap_uint<32> > pu_results[PU_NM];
 #pragma HLS stream variable=pu_results depth=1024
 #pragma HLS bind_storage variable=pu_results type=fifo impl=bram
+    hls::stream<ReStreamOrder> completed_jobs[PU_NM];
+#pragma HLS stream variable=completed_jobs depth=2
     hls::stream<bool> done[PU_NM];
 #pragma HLS stream variable=done depth=2
-    hls::stream<ReStreamOrder> order;
-#pragma HLS stream variable=order depth=64
+    hls::stream<ReStreamAssignment> assignments;
+#pragma HLS stream variable=assignments depth=64
+    hls::stream<ReStreamOrder> completions;
+#pragma HLS stream variable=completions depth=64
 
     broadcastRuleUpdates<PU_NM>(rule_updates, rule_update_done,
                                 pu_rule_updates, pu_rule_update_done);
-    dispatchMsgByFreePU<PU_NM>(jobs, messages, done, pu_jobs, pu_messages, order);
+    dispatchJobsByFreePU<PU_NM>(jobs, done, pu_jobs, assignments);
+    routeMessagesByPU<PU_NM>(assignments, messages, pu_messages);
     processingUnits<PU_NM>(pu_rule_updates, pu_rule_update_done,
-                           pu_jobs, pu_messages, pu_results, done);
-    collectResults<PU_NM>(order, pu_results, output_order, output_words);
+                           pu_jobs, pu_messages, pu_results, completed_jobs, done);
+    mergeCompletedJobs<PU_NM>(completed_jobs, completions);
+    collectResults<PU_NM>(completions, pu_results, output_order, output_words);
 }
 
 } // namespace re_streaming

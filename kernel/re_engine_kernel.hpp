@@ -89,6 +89,10 @@ struct match_out {
     // Legacy step-model backpressure flag. The streaming hardware keeps this
     // low and uses AXIS TREADY when its input queues are full.
     ap_uint<1>   halt;
+    // SOP sequence number, starting at zero after reset and wrapping at 2^32.
+    // Every chunk of the record carries the same ID. SOP packets that are
+    // dropped still consume an ID. Synthesized MMIO exposes it at 0xcc.
+    ap_uint<32>  message_id;
 };
 
 extern "C" void reEngineKernel(

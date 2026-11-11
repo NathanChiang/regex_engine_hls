@@ -107,6 +107,14 @@ module tb_mmio;
       @(negedge clk); tvalid = 0;
     end
   endtask
+  task send_six_bytes(input [47:0] bytes);
+    begin
+      @(negedge clk); tdata = bytes; tkeep = 63; tlast = 1;
+      tuser = (65'h1001 << 1) | 1; tvalid = 1;
+      @(posedge clk); while (!tready) @(posedge clk);
+      @(negedge clk); tvalid = 0;
+    end
+  endtask
   reg [31:0] value;
   integer i;
   initial begin
@@ -168,6 +176,36 @@ module tb_mmio;
     command(1, 1, 'h1000, 'h2000);
     wr('h20, 0);
     repeat (128) @(posedge clk);
+    // Match x + yzab + [c], exercising an unaligned four-byte literal and
+    // class lookup with distinct payload bytes in the production VM RTL.
+    command(3, 1, 0, 13);
+    command(3, 1, 8, 64'h0001000100000007);
+    command(3, 1, 16, 64'h2300000000000000); // BEGIN_BUF
+    command(3, 1, 24, 64'h0701780000000000); // x
+    command(3, 1, 32, 64'h0704797a61620000); // yzab, crosses a 32-bit boundary
+    command(3, 1, 40, 64'h0e01000000000000); // CCLASS, class zero
+    command(3, 1, 48, 64'h2400000000000000); // END_BUF
+    command(3, 1, 56, 64'h0100000000000000);
+    command(3, 1, 64, 64'h0100000000000000); // instruction guard
+    command(3, 1, 72, 0);
+    command(3, 1, 80, 64'h0000000800000000); // bitmap bit 99 ('c')
+    command(3, 1, 88, 0);
+    command(3, 1, 96, 0);
+    wr('h20, 0); repeat (128) @(posedge clk);
+    send_six_bytes(48'h6362617a7978); // xyzabc
+    poll('hc8, 'h00010101, 'h00000100);
+    rd('h80, value); if (value !== 1) $fatal(1, "Unaligned literal/class match failed");
+    rd('h84, value); if (value !== 'h00060000) $fatal(1, "Literal/class captures changed");
+    for (i = 2; i < 16; i = i + 1) begin
+      rd('h80 + 4*i, value); if (value !== 0) $fatal(1, "Literal/class result padding changed");
+    end
+    wr('h18, 1); poll('hc8, 'h00010101, 1);
+    wr('h18, 0); poll('hc8, 'h00010101, 0);
+    send_six_bytes(48'h6462617a7978); // xyzabd: class mismatch
+    poll('hc8, 'h00010101, 'h00000100);
+    rd('h80, value); if (value !== 0) $fatal(1, "Class mismatch incorrectly matched");
+    wr('h18, 1); poll('hc8, 'h00010101, 1);
+    wr('h18, 0); poll('hc8, 'h00010101, 0);
     // Reset with an outstanding result, clear, and run again.
     send_packet(); poll('hc8, 'h100, 'h100);
     @(negedge clk); reset_n = 0;
@@ -176,7 +214,7 @@ module tb_mmio;
     configure(); send_packet(); poll('hc8, 'h00010101, 'h00000100);
     rd('h80, value); if (value !== 1) $fatal(1, "Warm reset recovery failed");
     rd('hcc, value); if (value !== 0) $fatal(1, "Warm reset did not restart message IDs");
-    $display("PASS production RTL: AXI configuration, IOVA delete/miss/reuse, DMA sidebands, stable MMIO, held acknowledgements, warm reset");
+    $display("PASS production RTL: AXI configuration, IOVA delete/miss/reuse, unaligned literal/class match/miss, DMA sidebands, stable MMIO, held acknowledgements, warm reset");
     $finish;
   end
 endmodule

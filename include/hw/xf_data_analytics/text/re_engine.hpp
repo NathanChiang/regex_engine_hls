@@ -174,9 +174,12 @@ void readMsg512ToBuff(ap_uint<16> len, hls::stream<ap_uint<512> >& msg_strm, ap_
         ap_uint<512> in = msg_strm.read();
         for (int j = 0; j < 16; ++j) {
 #pragma HLS pipeline II = 1
+            // Fixed wiring plus a shift register avoids a 512-bit indexed mux.
+            ap_uint<32> word = in.range(31, 0);
+            in >>= 32;
             int word_id = 16 * i + j;
             if (word_id < len_32b) {
-                msg_buff[word_id] = in.range(32 * j + 31, 32 * j);
+                msg_buff[word_id] = word;
             }
         }
     }

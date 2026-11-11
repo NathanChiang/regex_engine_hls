@@ -254,8 +254,8 @@ void mergeCompletedJobs(hls::stream<ReStreamOrder> completed_jobs[PU_NM],
     ap_uint<8> next = 0;
     while (true) {
         // Allow registers between round-robin mask/select/encode/advance operations.
-        // A ticket every three clocks is ample for the multi-word result collector.
-#pragma HLS pipeline II=3
+        // Two clocks cover this feedback path with the 3.8 ns scheduling budget.
+#pragma HLS pipeline II=2
         ap_uint<PU_NM> ready = 0;
         for (int p = 0; p < PU_NM; ++p) {
 #pragma HLS unroll
@@ -325,7 +325,8 @@ void engine(hls::stream<ReRuleUpdate>& rule_updates,
 #pragma HLS stream variable=pu_jobs depth=2
     hls::stream<ap_uint<512> > pu_messages[PU_NM];
 #pragma HLS stream variable=pu_messages depth=64
-#pragma HLS bind_storage variable=pu_messages type=fifo impl=bram
+// Preserve a full packet per PU without wasting deep BRAMs on 64-word FIFOs.
+#pragma HLS bind_storage variable=pu_messages type=fifo impl=lutram
     hls::stream<ap_uint<32> > pu_results[PU_NM];
 #pragma HLS stream variable=pu_results depth=1024
 #pragma HLS bind_storage variable=pu_results type=fifo impl=bram

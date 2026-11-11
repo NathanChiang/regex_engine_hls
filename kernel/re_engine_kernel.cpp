@@ -395,6 +395,11 @@ static void re_config_lookup(volatile ap_uint<32> cfg_mmio[6],
     ap_uint<1> lookup_rearm = 0;
     ap_uint<7> outstanding_packets = 0;
     RePacketStart pending_start;
+    // Separate bucket selection from rule validation without duplicating RAM.
+    re_iova_lookup_status registered_iova_lookup;
+    registered_iova_lookup.ack = 0;
+    registered_iova_lookup.hit = 0;
+    registered_iova_lookup.job_id = 0;
 
     while (true) {
         cfg_input cfg_in;
@@ -450,9 +455,10 @@ static void re_config_lookup(volatile ap_uint<32> cfg_mmio[6],
         }
         re_engine_iova_table(table_cfg, dma_address, dma_address_valid,
                              iova_status, iova_lookup);
-        re_engine_rule_table(table_cfg, iova_lookup,
+        re_engine_rule_table(table_cfg, registered_iova_lookup,
                              rule_updates, rule_update_done,
                              rule_status, rule_lookup);
+        registered_iova_lookup = iova_lookup;
 
         if (rule_lookup.ack) {
             ReMappedPacket mapped;
@@ -612,8 +618,13 @@ static void re_stream_egress(volatile ap_uint<32> result_in[2],
             ap_uint<512> chunk = 0;
             for (int i = 0; i < 16; ++i) {
 #pragma HLS pipeline II=1
+                ap_uint<32> word = 0;
                 if (base + i < total)
-                    chunk.range(32 * i + 31, 32 * i) = words.read();
+                    word = words.read();
+                // After sixteen shifts, word zero occupies bits 31:0 and
+                // unused final-chunk words are zero, without an indexed store.
+                chunk >>= 32;
+                chunk.range(511, 480) = word;
             }
             // Require low before each rising-edge acknowledgement.
             ap_uint<1> sampled_ack = read_result_ack(result_in);
@@ -702,6 +713,7 @@ extern "C" void reEngineKernel(
 #pragma HLS stream variable=packet_completions depth=64
     hls::stream<ReStreamJob> jobs("jobs");
 #pragma HLS stream variable=jobs depth=64
+#pragma HLS bind_storage variable=jobs type=fifo impl=lutram
     hls::stream<ap_uint<512> > messages("messages");
 #pragma HLS stream variable=messages depth=1024
 #pragma HLS bind_storage variable=messages type=fifo impl=bram

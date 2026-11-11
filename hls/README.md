@@ -2,7 +2,7 @@
 
 This target is a standalone Vivado IP with AXI-Lite configuration/results and
 AXI4-Stream DMA input, targeting `xcvc1902-vsva2197-2MP-e-S` at a 4 ns
-(250 MHz) clock, with the default HLS clock uncertainty retained.
+(250 MHz) clock with 0.2 ns uncertainty, giving HLS a 3.8 ns logic budget.
 The legacy Alveo OpenCL host path and `conn_u*.cfg` files do not connect this
 interface. Integrate the exported IP in the VCK190 PL design.
 
@@ -97,11 +97,17 @@ one project. Use a clean project if changing tool versions.
   This one sequence counter replaces the measure branch's large diagnostic
   event/counter pipeline. The AXIS and AXI-Lite ports are otherwise unchanged.
 - `regexVM_opt` lets HLS choose the pipeline II to meet the clock target;
-  the 4 ns Vitis HLS 2021.2 build achieves II=6. Completion arbitration
-  achieves II=3 to register its feedback path. These intervals trade execution
-  throughput for shorter clock stages; DMA packet bodies still achieve II=1.
+  the 4 ns / 0.2 ns uncertainty Vitis HLS 2021.2 build achieves II=4.
+  Completion arbitration achieves II=2 to register its feedback path. DMA
+  packet bodies still achieve II=1. The previous 1.08 ns uncertainty build
+  achieved VM II=6 and arbitration II=3.
   A PU is reusable only after its VM call and result copy finish, so its message
   and capture buffers are no longer in use.
+- Payload unpacking, VM byte-window selection, and result packing use bounded
+  byte selectors or fixed shifts instead of variable-width slice writes. The
+  64-beat PU input FIFOs and 64-entry job FIFO use distributed RAM to avoid
+  allocating deep BRAMs for shallow, wide queues. Their capacities are unchanged.
+  A registered IOVA response separates bucket selection from rule validation.
 - In hardware, start the AXI-Lite-controlled kernel once (`ap_ctrl_hs`) after
   reset. It then runs continuously. Configuration and result-acknowledgement
   MMIO inputs are reread while it runs; software must not wait for `ap_done`.
@@ -109,7 +115,10 @@ one project. Use a clean project if changing tool versions.
   at 0x20; `cfg_out` is at 0x10 and `result_out` begins at 0x80. Use the
   generated driver header for the exact register map.
 - The C simulation uses a finite, one-packet step model for the existing MMIO
-  regression harness. The default production-dimension smoke test checks
+  regression harness. The default test checks random-payload unpacking for
+  every length from 0 through 4088 bytes, including guard words and untouched
+  memory, and VM match/capture checks for all 256 byte-class values and
+  unaligned literals. The production-dimension kernel smoke test checks
   configuration, rule lookup, DMA-miss, and malformed-packet handling without
   entering the expensive VM stress cases. `RE_HLS_EXHAUSTIVE_CSIM=1` adds the
   full table-capacity/reference and regex stress regression. Neither C model
@@ -172,7 +181,8 @@ This explicit C-reference/RTL flow is required because the start-once
 `ap_ctrl_hs` kernel deliberately never asserts `ap_done`; the standard HLS
 transaction wrapper cannot modify live MMIO registers while waiting for that
 transaction to return. The smaller `tb_mmio.sv` separately checks stable
-result reads, IOVA deletion/miss/reuse, and reset with a pending result.
+result reads, IOVA deletion/miss/reuse, unaligned literal/class match and
+mismatch with captures/padding, and reset with a pending result.
 
 `tb_streaming.sv` checks that a short second job overtakes a long first job,
 then runs 80 messages of 3, 65, and 4088 bytes: 16 maximum-size capture records
@@ -187,16 +197,35 @@ are written under `build/mmio_<project>_streaming/`.
 These checks do not establish routed timing, a bitstream, PCIe/NVMe subsystem
 integration, or board operation. HLS resource/timing numbers are estimates.
 
-The Vitis HLS 2021.2 timing run `re_engine_direct_250mhz_registered` reports
-2.920 ns estimated delay at the 4.00 ns target with 1.08 ns clock uncertainty.
-All 27 module reports meet the resulting 2.92 ns scheduling budget, with no
-HLS timing-violation warnings. The previous 6 ns build estimated 6.355 ns.
-The top-level RTL ports and AXI-Lite addresses match that build. The extra
-pipeline stages increase FFs from 76,757 to 95,683 and LUTs from 209,531 to
-212,425; BRAM (786 BRAM_18K) and URAM (48) counts are unchanged.
-The production IOVA/rule C regressions, kernel smoke test, MMIO RTL regression,
-and 80-record streaming RTL regression all passed. The RTL benches use a 4 ns
-clock; the streaming run accepted 61 consecutive DMA body beats at II=1.
+The Vitis HLS 2021.2 area run `re_engine_direct_250mhz_u02_area_final` reports
+3.790 ns estimated delay at the 4.00 ns target with 0.20 ns clock uncertainty.
+All 27 module reports meet the resulting 3.8 ns scheduling budget, with no
+HLS timing-violation warnings. The top-level RTL ports and AXI-Lite addresses
+match the previous `re_engine_direct_250mhz_registered` build.
+
+| HLS estimate | Previous 1.08 ns uncertainty | Current 0.20 ns uncertainty | Change |
+| --- | ---: | ---: | ---: |
+| LUT | 212,425 | 111,750 | -47.4% |
+| BRAM_18K | 786 | 538 | -31.6% |
+| URAM | 48 | 48 | unchanged |
+| FF | 95,683 | 96,197 | +0.5% |
+
+The distributed-RAM FIFOs save 248 BRAM_18K units while retaining their
+depths. The instruction replicas and 8192-entry VM stacks retain their URAM
+mapping and capacities; moving them would increase BRAM or LUT consumption.
+The C regression and 273 direct comparisons with the previous VM passed.
+The final MMIO and 80-record streaming RTL regressions also passed at a 4 ns
+clock with production dimensions. The streaming run accepted 61 consecutive
+DMA body beats at II=1. A focused RTL test additionally checked random,
+nonuniform payloads at 15 partial/full/multiple/max-beat lengths.
+
+To reproduce the reported build and its RTL checks from this directory:
+
+```sh
+RE_HLS_ACTION=synth_only RE_HLS_PROJECT_SUFFIX=_250mhz_u02_area_final vitis_hls -f run_hls.tcl
+RE_HLS_RTL_PROJECT=re_engine_direct_250mhz_u02_area_final python3 run_rtl_mmio.py
+RE_HLS_RTL_PROJECT=re_engine_direct_250mhz_u02_area_final RE_HLS_RTL_BENCH=streaming python3 run_rtl_mmio.py
+```
 
 The interface choices follow the 2021.2 documentation on
 [AXI stream side channels](https://docs.amd.com/r/2021.2-English/ug1399-vitis-hls/How-AXI4-Stream-is-Implemented)

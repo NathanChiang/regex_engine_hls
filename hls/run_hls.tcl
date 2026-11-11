@@ -44,8 +44,9 @@ if {$bench eq "smoke"} {
 }
 open_solution -flow_target vivado $bench
 set_part xcvc1902-vsva2197-2MP-e-S
-# 250 MHz; retain the tool's default clock uncertainty for scheduling margin.
+# 250 MHz with a 3.8 ns scheduling budget and 0.2 ns uncertainty.
 create_clock -period 4 -name default
+set_clock_uncertainty 0.2 default
 # Keep small control/memory-copy loops rolled unless explicitly pipelined.
 config_compile -pipeline_loops 0
 # Reset the FSMs/counters, then software issues CLEAR to invalidate table RAM.

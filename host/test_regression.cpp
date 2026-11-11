@@ -8,10 +8,93 @@
 #include "re_engine_iova_table.hpp"
 #include "re_engine_rule_table.hpp"
 #include "xf_data_analytics/text/enums.hpp"
+#include "xf_data_analytics/text/re_engine.hpp"
 
 #define CHECK(c) do { if (!(c)) { \
     std::fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #c); std::exit(1); \
 } } while (0)
+
+static void test_message_unpacking() {
+    uint32_t seed = 0x41c64e6d;
+    const uint32_t untouched = 0xa5c39e17;
+    for (unsigned length = 0; length <= RE_MAX_PACKET_BYTES; ++length) {
+        hls::stream<ap_uint<512> > messages;
+        std::vector<uint32_t> input_words;
+        ap_uint<32> memory[RE_MSG_LEN * 2];
+        for (unsigned i = 0; i < RE_MSG_LEN * 2; ++i) memory[i] = untouched;
+        for (unsigned beat = 0; beat < (length + 63) / 64; ++beat) {
+            ap_uint<512> data = 0;
+            for (unsigned word = 0; word < 16; ++word) {
+                seed = seed * 1664525u + 1013904223u;
+                input_words.push_back(seed);
+                data.range(32 * word + 31, 32 * word) = seed;
+            }
+            messages.write(data);
+        }
+        xf::data_analytics::text::internal::readMsg512ToBuff<RE_MSG_LEN>(
+            length, messages, memory);
+        const unsigned copied_words = ((length + 7) / 8) * 2;
+        for (unsigned i = 0; i < RE_MSG_LEN * 2; ++i) {
+            const uint32_t expected = i < copied_words ? input_words[i] :
+                i < copied_words + 2 ? 0 : untouched;
+            CHECK(memory[i] == expected);
+        }
+        CHECK(messages.empty());
+    }
+    std::printf("PASS DMA unpacking: %u lengths, random words, guards, untouched memory\n",
+                unsigned(RE_MAX_PACKET_BYTES + 1));
+}
+
+static void test_vm_byte_selectors() {
+    using namespace xf::data_analytics::text;
+    static ap_uint<32> bitsets[1024];
+    // Non-capture instructions also cause discarded speculative offset reads.
+    // Pad C-model scratch to cover every 16-bit operand and its successor.
+    static ap_uint<16> offsets[65537];
+    ap_uint<64> instructions[256];
+    ap_uint<32> message[8];
+    auto run = [&](const unsigned char* bytes, unsigned length, bool expected) {
+        for (unsigned i = 0; i < 8; ++i) message[i] = 0;
+        for (unsigned i = 0; i < length; ++i)
+            message[i / 4].range(8 * (i % 4) + 7, 8 * (i % 4)) = bytes[i];
+        offsets[0] = -1; offsets[1] = -1;
+        ap_uint<2> match = 3;
+        regexVM_opt<128>(bitsets, instructions, message, length, match, offsets);
+        CHECK(match == unsigned(expected));
+        if (expected) CHECK(offsets[0] == 0 && offsets[1] == length);
+    };
+    uint32_t seed = 0x18e43;
+    for (unsigned i = 0; i < 8; ++i) {
+        seed = seed * 1664525u + 1013904223u;
+        bitsets[i] = seed;
+    }
+    for (unsigned i = 0; i < 256; ++i)
+        instructions[i] = ap_uint<64>(OP_END) << 56;
+    instructions[0] = (ap_uint<64>(OP_CCLASS) << 56) | (ap_uint<64>(1) << 48);
+    for (unsigned byte = 0; byte < 256; ++byte) {
+        const unsigned char text = byte;
+        const bool expected = (bitsets[byte / 32].to_uint() & (1u << (byte % 32))) != 0;
+        run(&text, 1, expected);
+    }
+    for (unsigned prefix = 1; prefix < 4; ++prefix) {
+        for (unsigned i = 0; i < 256; ++i)
+            instructions[i] = ap_uint<64>(OP_END) << 56;
+        ap_uint<64> first = (ap_uint<64>(OP_STR_N) << 56) | (ap_uint<64>(prefix) << 48);
+        for (unsigned i = 0; i < prefix; ++i)
+            first.range(47 - 8 * i, 40 - 8 * i) = "xyz"[i];
+        instructions[0] = first;
+        instructions[1] = (ap_uint<64>(OP_STR_N) << 56) | (ap_uint<64>(4) << 48) |
+                          (ap_uint<64>(0x61626364) << 16);
+        instructions[2] = ap_uint<64>(OP_END_BUF) << 56;
+        unsigned char text[7] = {};
+        for (unsigned i = 0; i < prefix; ++i) text[i] = "xyz"[i];
+        for (unsigned i = 0; i < 4; ++i) text[prefix + i] = "abcd"[i];
+        run(text, prefix + 4, true);
+        text[prefix + 3] = 'X';
+        run(text, prefix + 4, false);
+    }
+    std::puts("PASS VM byte selectors: 256 class bytes, unaligned literal match/miss, captures");
+}
 
 #ifndef RE_HLS_COSIM
 static cfg_input tc = {};
@@ -330,6 +413,8 @@ static void test_kernel() {
 #endif
 }
 int main() {
+    test_message_unpacking();
+    test_vm_byte_selectors();
 #if defined(RE_HLS_EXHAUSTIVE_CSIM) && !defined(RE_HLS_COSIM) && !defined(RE_HLS_QUICK_CSIM)
     std::puts("RUN exhaustive IOVA/rule-table regression");
     std::fflush(stdout);

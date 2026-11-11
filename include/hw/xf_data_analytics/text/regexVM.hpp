@@ -745,7 +745,7 @@ LOOP_VM:
         ap_uint<8> prev_char = 0x0a;
         if (str_ptr > 0) {
             ap_uint<2> prev_pos = (str_ptr - 1) % 4;
-            prev_char = prev_str.range((prev_pos + 1) * 8 - 1, prev_pos * 8);
+            prev_char = prev_str >> (prev_pos * 8);
         }
         // fetch current sub-string
         ap_uint<32> cur_str = msgBuff[str_ptr >> 2];
@@ -755,13 +755,13 @@ LOOP_VM:
         // pre-exec the comparator of string
         ap_uint<32> cmp_str_1_1 = instruction_1.range(47, 16);
         ap_uint<32> cmp_str_2_1 = instruction_2.range(47, 16);
-        ap_uint<32> cmp_str_2 = 0;
-
-        ap_uint<3> len_0_t = 4 - cur_pos;
-        ap_uint<3> len_1_t = 4 - len_0_t;
-        // concatenate the actual sub-string (32-bit) for matching
-        cmp_str_2.range(8 * len_0_t - 1, 0) = cur_str.range((cur_pos + len_0_t) * 8 - 1, cur_pos * 8);
-        if (len_0_t != 4) cmp_str_2.range(31, 8 * len_0_t) = next_str.range(len_1_t * 8 - 1, 0);
+        // A four-position byte mux replaces variable-width slice writes.
+        ap_uint<64> string_window = 0;
+        string_window.range(31, 0) = cur_str;
+        string_window.range(63, 32) = next_str;
+        ap_uint<5> byte_shift = 0;
+        byte_shift.range(4, 3) = cur_pos;
+        ap_uint<32> cmp_str_2 = string_window >> byte_shift;
 
         ap_uint<4> cmp_flag_1 = 0;
         for (int k = 0; k < 4; ++k) {
@@ -798,13 +798,13 @@ LOOP_VM:
         }
 
         //// read current character
-        ap_uint<8> cur_char = cur_str.range((cur_pos + 1) * 8 - 1, cur_pos * 8);
+        ap_uint<8> cur_char = cur_str >> (cur_pos * 8);
         // pre-fetch bitset buffer
         ap_uint<10> bit_addr_1 = ((unsigned int)cur_char >> 5) + (unsigned int)operand1_1;
-        bool predict_cc_cmp_1 = ((bitSetBuff[bit_addr_1] & (1u << ((unsigned int)cur_char & 0x1f))) == 0);
+        bool predict_cc_cmp_1 = !bitSetBuff[bit_addr_1][cur_char.range(4, 0)];
 
         ap_uint<10> bit_addr_2 = ((unsigned int)cur_char >> 5) + (unsigned int)operand1_2;
-        bool predict_cc_cmp_2 = ((bitSetBuff[bit_addr_2] & (1u << ((unsigned int)cur_char & 0x1f))) == 0);
+        bool predict_cc_cmp_2 = !bitSetBuff[bit_addr_2][cur_char.range(4, 0)];
 
         // pre-fetch start/end offset address
         ap_uint<16> mem_start; // = offsetBuff[operand1];

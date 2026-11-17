@@ -17,6 +17,22 @@ if {$action in {perf perf_only}} { set bench perf }
 if {$bench ni {smoke log cosim perf}} { error "Unknown RE_HLS_TESTBENCH: $bench" }
 if {[info exists ::env(DEBUG)]} { unset ::env(DEBUG) }
 
+# Tcl's exec command buffers all child output until the command exits.  That
+# makes a long RTL simulation look hung immediately after csynth_design.  Read
+# the child through a pipe instead so the Python runner's stage messages and
+# heartbeats remain visible in the Vitis HLS console.
+proc run_streaming {command} {
+    set pipeline [linsert $command 0 |]
+    lappend pipeline 2>@1
+    set channel [open $pipeline r]
+    fconfigure $channel -buffering line -blocking 1
+    while {[gets $channel line] >= 0} {
+        puts $line
+        flush stdout
+    }
+    close $channel
+}
+
 set flags "-std=c++14 -D__gmp_const=const -DHLS_TEST -I$root/kernel -I$root/include/hw"
 if {$bench eq "smoke" && [info exists ::env(RE_HLS_QUICK_CSIM)] && $::env(RE_HLS_QUICK_CSIM) eq "1"} {
     append flags " -DRE_HLS_QUICK_CSIM"
@@ -66,8 +82,8 @@ if {$action in {cosim cosim_only}} {
     set cosim_lines 1000
     if {[info exists ::env(RE_HLS_COSIM_LINES)]} { set cosim_lines $::env(RE_HLS_COSIM_LINES) }
     set cosim_cmd [list $python "$here/run_cosim.py" --project $project --solution $bench --lines $cosim_lines]
-    set cosim_status [catch {exec {*}$cosim_cmd 2>@1} cosim_output]
-    puts $cosim_output
+    set cosim_status [catch {run_streaming $cosim_cmd} cosim_output]
+    if {$cosim_status} { puts $cosim_output }
     if {$cosim_status} { error "Persistent RTL C/RTL regression failed" }
 }
 if {$action in {perf perf_only}} {
@@ -76,8 +92,8 @@ if {$action in {perf perf_only}} {
     set python python3
     if {[info exists ::env(RE_HLS_PYTHON)]} { set python $::env(RE_HLS_PYTHON) }
     set perf_cmd [list $python "$here/run_perf_cosim.py" --project $project --solution $bench]
-    set perf_status [catch {exec {*}$perf_cmd 2>@1} perf_output]
-    puts $perf_output
+    set perf_status [catch {run_streaming $perf_cmd} perf_output]
+    if {$perf_status} { puts $perf_output }
     if {$perf_status} { error "Persistent RTL performance simulation failed" }
 }
 if {$action eq "export"} { export_design -format ip_catalog }

@@ -15,14 +15,50 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 
 
-def run_logged(command, cwd, log_path, env=None, timeout=600):
+def last_log_line(log_path, size):
+    if not size:
+        return ""
+    with log_path.open("rb") as log:
+        log.seek(max(0, size - 4096))
+        lines = log.read().decode("utf-8", errors="replace").splitlines()
+    return lines[-1][-240:] if lines else ""
+
+
+def run_logged(command, cwd, log_path, env=None, timeout=600,
+               heartbeat_seconds=30):
     print("Running " + " ".join(str(item) for item in command), flush=True)
     with log_path.open("w") as log:
-        subprocess.run(command, cwd=str(cwd), stdout=log,
-                       stderr=subprocess.STDOUT, check=True, env=env,
-                       timeout=timeout)
+        process = subprocess.Popen(command, cwd=str(cwd), stdout=log,
+                                   stderr=subprocess.STDOUT, env=env)
+        start = time.monotonic()
+        while True:
+            elapsed = time.monotonic() - start
+            remaining = timeout - elapsed
+            if remaining <= 0:
+                process.kill()
+                process.wait()
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                return_code = process.wait(
+                    timeout=min(heartbeat_seconds, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                log.flush()
+                size = log_path.stat().st_size if log_path.exists() else 0
+                elapsed = time.monotonic() - start
+                latest = last_log_line(log_path, size)
+                latest_text = "; last=" + latest if latest else ""
+                print("Still running {}: {:.0f}s elapsed; log={} ({} bytes){}".
+                      format(pathlib.Path(str(command[0])).name, elapsed,
+                             log_path, size, latest_text), flush=True)
+        if return_code:
+            raise subprocess.CalledProcessError(return_code, command)
+    print("Finished {} in {:.1f}s; log={}".
+          format(pathlib.Path(str(command[0])).name,
+                 time.monotonic() - start, log_path), flush=True)
 
 
 def main():
@@ -30,7 +66,12 @@ def main():
     parser.add_argument("--project", default="re_engine_cosim")
     parser.add_argument("--solution", default="cosim")
     parser.add_argument("--lines", type=int, default=1000)
+    parser.add_argument(
+        "--xsim-timeout", type=int, default=0,
+        help="xsim wall-clock timeout in seconds; 0 scales with line count")
     args = parser.parse_args()
+    if args.lines <= 0:
+        parser.error("--lines must be positive")
 
     here = pathlib.Path(__file__).resolve().parent
     re_engine = pathlib.Path(
@@ -102,11 +143,16 @@ def main():
     (work / "cosim.prj").write_text("\n".join(project_lines) + "\n")
     (work / "run.tcl").write_text("run all\nquit\n")
 
+    # Large log regressions still depend on host speed.  Keep the historical
+    # one-hour minimum, but do not kill a valid 5k run merely because it takes
+    # longer.  The SystemVerilog cycle watchdog remains the deadlock guard.
+    xsim_timeout = (args.xsim_timeout if args.xsim_timeout > 0 else
+                    max(3600, args.lines))
     tools = [
         ("xvlog", ["-prj", "cosim.prj"], 600),
         ("xelab", ["xil_defaultlib.test_cosim", "-s", "re_cosim",
                     "-mt", "2"], 600),
-        ("xsim", ["re_cosim", "-tclbatch", "run.tcl"], 3600),
+        ("xsim", ["re_cosim", "-tclbatch", "run.tcl"], xsim_timeout),
     ]
     for tool, tool_args, timeout in tools:
         executable = shutil.which(tool)
@@ -122,7 +168,12 @@ def main():
     if not pass_lines or "Fatal:" in simulation_log:
         sys.exit("C/RTL regression failed; inspect " +
                  str(work / "xsim_console.log"))
+    cycle_report = work / "re_engine_kernel_cycles.csv"
+    if not cycle_report.exists():
+        sys.exit("C/RTL regression did not create cycle report: " +
+                 str(cycle_report))
     print(pass_lines[-1])
+    print("Cycle report: " + str(cycle_report))
 
 
 if __name__ == "__main__":

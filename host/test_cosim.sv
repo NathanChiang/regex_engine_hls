@@ -4,6 +4,8 @@
 `timescale 1ns/1ps
 
 module test_cosim;
+  localparam integer PERF_INFLIGHT_LIMIT = 16;
+
   reg clk = 0;
   always #4.5 clk = ~clk;
 
@@ -31,6 +33,7 @@ module test_cosim;
   wire tready;
   wire [511:0] perf_tdata;
   wire perf_tvalid;
+  wire perf_tready = 1'b1;
 
   reEngineKernel dut (
     .ap_clk(clk),
@@ -61,7 +64,7 @@ module test_cosim;
     .dma_in_TREADY(tready),
     .perf_out_TDATA(perf_tdata),
     .perf_out_TVALID(perf_tvalid),
-    .perf_out_TREADY(1'b1)
+    .perf_out_TREADY(perf_tready)
   );
 
   initial begin
@@ -185,24 +188,215 @@ module test_cosim;
   integer words_per_message;
   integer expected_message_count;
   integer expected_words_per_message;
-  integer message;
   integer word;
-  integer beat;
-  integer chunk;
-  integer chunk_words;
-  integer message_length;
-  integer beat_count;
-  integer remaining_bytes;
-  integer beat_bytes;
+  integer cycle_file;
+  integer perf_message_records = 0;
+  integer perf_snapshot_records = 0;
   reg [63:0] configuration_word;
-  reg [63:0] message_address;
-  reg [511:0] beat_data;
-  reg [63:0] beat_keep;
-  reg [31:0] actual_word;
-  reg [31:0] expected_word;
-  reg [31:0] result_address_low;
-  reg [31:0] result_address_high;
-  reg expected_match;
+  reg [39:0] current_regexvm_cycles;
+  reg [39:0] current_kernel_cycles;
+  reg [39:0] min_regexvm_cycles = 40'hffffffffff;
+  reg [39:0] max_regexvm_cycles = 0;
+  reg [39:0] min_kernel_cycles = 40'hffffffffff;
+  reg [39:0] max_kernel_cycles = 0;
+  reg [63:0] total_regexvm_cycles = 0;
+  reg [63:0] total_kernel_cycles = 0;
+  reg [15:0] telemetry_correlator_drops = 0;
+
+  initial begin
+    cycle_file = $fopen("re_engine_kernel_cycles.csv", "w");
+    if (!cycle_file) $fatal(1, "Cannot create re_engine_kernel_cycles.csv");
+    $fdisplay(cycle_file,
+      "message_id,job_id,processing_unit,message_bytes,rule_bytes,dma_beats,regexVM_cycles,kernel_cycles,sop_cycle,iova_cycle,rule_cycle,ready_cycle,dispatch_cycle,pu_input_cycle,compute_start_cycle,compute_done_cycle,result_cycle,iova_cycles,rule_lookup_cycles,join_cycles,scheduler_cycles,pu_load_cycles,result_buffer_cycles,correlator_drops");
+  end
+
+  // The regexVM unit bench measures ap_start -> ap_done.  The synthesized
+  // full kernel exposes the corresponding VM compute-start/compute-done
+  // timestamps in each type-1 performance record.  It also exposes DMA SOP
+  // through result-buffered timestamps for a true full-kernel cycle count.
+  always @(posedge clk) begin
+    if (perf_tvalid && perf_tready) begin
+      if (perf_tdata[3:0] == 1) begin
+        current_regexvm_cycles =
+          perf_tdata[403:364] - perf_tdata[363:324];
+        current_kernel_cycles =
+          perf_tdata[443:404] - perf_tdata[123:84];
+        perf_message_records <= perf_message_records + 1;
+        total_regexvm_cycles <= total_regexvm_cycles +
+                                current_regexvm_cycles;
+        total_kernel_cycles <= total_kernel_cycles + current_kernel_cycles;
+        if (current_regexvm_cycles < min_regexvm_cycles)
+          min_regexvm_cycles <= current_regexvm_cycles;
+        if (current_regexvm_cycles > max_regexvm_cycles)
+          max_regexvm_cycles <= current_regexvm_cycles;
+        if (current_kernel_cycles < min_kernel_cycles)
+          min_kernel_cycles <= current_kernel_cycles;
+        if (current_kernel_cycles > max_kernel_cycles)
+          max_kernel_cycles <= current_kernel_cycles;
+        if (perf_tdata[475:460] > telemetry_correlator_drops)
+          telemetry_correlator_drops <= perf_tdata[475:460];
+
+        $fdisplay(cycle_file,
+          "%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d",
+          perf_tdata[35:4], perf_tdata[43:36], perf_tdata[51:44],
+          perf_tdata[67:52], perf_tdata[83:68], perf_tdata[459:444],
+          current_regexvm_cycles, current_kernel_cycles,
+          perf_tdata[123:84], perf_tdata[163:124],
+          perf_tdata[203:164], perf_tdata[243:204],
+          perf_tdata[283:244], perf_tdata[323:284],
+          perf_tdata[363:324], perf_tdata[403:364],
+          perf_tdata[443:404],
+          perf_tdata[163:124] - perf_tdata[123:84],
+          perf_tdata[203:164] - perf_tdata[163:124],
+          perf_tdata[243:204] - perf_tdata[203:164],
+          perf_tdata[283:244] - perf_tdata[243:204],
+          perf_tdata[363:324] - perf_tdata[323:284],
+          perf_tdata[443:404] - perf_tdata[403:364],
+          perf_tdata[475:460]);
+        if ((perf_message_records + 1) % 100 == 0) $fflush(cycle_file);
+      end else if (perf_tdata[3:0] == 2) begin
+        perf_snapshot_records <= perf_snapshot_records + 1;
+      end
+    end
+  end
+
+  // Keep DMA production independent from result acknowledgement.  The old
+  // single loop waited for each result before sending the next message, which
+  // serialized a 16-PU kernel and made a 5k RTL regression take hours.  These
+  // tasks use separate vector files and interfaces, while the kernel's reorder
+  // path guarantees that the checked results remain in input order.
+  task automatic drive_messages;
+    integer producer_scan_result;
+    integer producer_message;
+    integer producer_beat;
+    integer producer_message_length;
+    integer producer_beat_count;
+    integer producer_remaining_bytes;
+    integer producer_beat_bytes;
+    reg [63:0] producer_message_address;
+    reg [511:0] producer_beat_data;
+    reg [63:0] producer_beat_keep;
+    begin
+      for (producer_message = 0; producer_message < message_count;
+           producer_message = producer_message + 1) begin
+        // The performance channel is deliberately nonblocking. Keep enough
+        // work in flight to occupy all PUs, but do not reuse a telemetry
+        // correlation slot before its record has been emitted.
+        while (producer_message - perf_message_records >=
+               PERF_INFLIGHT_LIMIT)
+          @(posedge clk);
+        producer_scan_result = $fscanf(input_file, "%d %h %d\n",
+                                       producer_message_length,
+                                       producer_message_address,
+                                       producer_beat_count);
+        if (producer_scan_result != 3)
+          $fatal(1, "Missing message header %0d", producer_message);
+
+        producer_remaining_bytes = producer_message_length;
+        for (producer_beat = 0; producer_beat < producer_beat_count;
+             producer_beat = producer_beat + 1) begin
+          producer_scan_result = $fscanf(input_file, "%h\n",
+                                         producer_beat_data);
+          if (producer_scan_result != 1)
+            $fatal(1, "Missing message %0d beat %0d",
+                   producer_message, producer_beat);
+          producer_beat_bytes = producer_remaining_bytes > 64 ?
+                                64 : producer_remaining_bytes;
+          producer_beat_keep = producer_beat_bytes == 64 ?
+                               64'hffffffffffffffff :
+                               ((64'h1 << producer_beat_bytes) - 1);
+          send_beat(producer_beat_data, producer_beat_keep,
+                    producer_message_address, producer_beat == 0,
+                    producer_beat + 1 == producer_beat_count);
+          producer_remaining_bytes = producer_remaining_bytes -
+                                     producer_beat_bytes;
+        end
+      end
+    end
+  endtask
+
+  task automatic check_results;
+    integer consumer_scan_result;
+    integer consumer_message;
+    integer consumer_chunk;
+    integer consumer_word;
+    integer consumer_chunk_words;
+    reg [63:0] consumer_expected_address;
+    reg [31:0] consumer_actual_word;
+    reg [31:0] consumer_expected_word;
+    reg [31:0] consumer_result_address_low;
+    reg [31:0] consumer_result_address_high;
+    reg consumer_expected_match;
+    begin
+      for (consumer_message = 0; consumer_message < message_count;
+           consumer_message = consumer_message + 1) begin
+        consumer_scan_result = $fscanf(expected_file, "%h\n",
+                                       consumer_expected_address);
+        if (consumer_scan_result != 1)
+          $fatal(1, "Missing expected address for message %0d",
+                 consumer_message);
+
+        consumer_expected_match = 0;
+        for (consumer_chunk = 0;
+             consumer_chunk < (words_per_message + 15) / 16;
+             consumer_chunk = consumer_chunk + 1) begin
+          poll(8'hc8, 32'h00010101, 32'h00000100);
+          axi_read(8'hc0, consumer_result_address_low);
+          axi_read(8'hc4, consumer_result_address_high);
+          if ({consumer_result_address_high, consumer_result_address_low} !==
+              consumer_expected_address)
+            $fatal(1, "Message %0d result address mismatch", consumer_message);
+
+          consumer_chunk_words = words_per_message - consumer_chunk * 16;
+          if (consumer_chunk_words > 16) consumer_chunk_words = 16;
+          for (consumer_word = 0; consumer_word < consumer_chunk_words;
+               consumer_word = consumer_word + 1) begin
+            consumer_scan_result = $fscanf(expected_file, "%h\n",
+                                           consumer_expected_word);
+            if (consumer_scan_result != 1)
+              $fatal(1, "Missing expected word for message %0d",
+                     consumer_message);
+            axi_read(8'h80 + consumer_word * 4, consumer_actual_word);
+            if (consumer_chunk == 0 && consumer_word == 0)
+              consumer_expected_match = consumer_expected_word[0];
+            if ((consumer_chunk == 0 && consumer_word == 0) ||
+                consumer_expected_match) begin
+              if (consumer_actual_word !== consumer_expected_word)
+                $fatal(1,
+                       "Result mismatch message=%0d word=%0d expected=%h actual=%h",
+                       consumer_message,
+                       consumer_chunk * 16 + consumer_word,
+                       consumer_expected_word, consumer_actual_word);
+            end
+          end
+
+          axi_write(8'h18, 1);
+          poll(8'hc8, 32'h00010101, 32'h00000001);
+          axi_write(8'h18, 0);
+          if (consumer_chunk + 1 == (words_per_message + 15) / 16)
+            poll(8'hc8, 32'h00010101, 0);
+        end
+
+        if ((consumer_message + 1) % 100 == 0 ||
+            consumer_message + 1 == message_count)
+          $display("C/RTL progress: checked %0d/%0d messages",
+                   consumer_message + 1, message_count);
+      end
+    end
+  endtask
+
+  task automatic wait_for_performance_records;
+    integer attempt;
+    begin : wait_for_perf
+      for (attempt = 0; attempt < 2000000; attempt = attempt + 1) begin
+        @(posedge clk);
+        #1;
+        if (perf_message_records == message_count) disable wait_for_perf;
+      end
+      $fatal(1, "Performance telemetry timeout: records=%0d expected=%0d",
+             perf_message_records, message_count);
+    end
+  endtask
 
   initial begin
     input_file = $fopen("cosim_input.txt", "r");
@@ -254,60 +448,27 @@ module test_cosim;
     axi_write(8'h20, 0);
     poll(8'h10, 32'h01010000, 32'h01010000);
 
-    for (message = 0; message < message_count; message = message + 1) begin
-      scan_result = $fscanf(input_file, "%d %h %d\n",
-                            message_length, message_address, beat_count);
-      if (scan_result != 3)
-        $fatal(1, "Missing message header %0d", message);
-
-      remaining_bytes = message_length;
-      for (beat = 0; beat < beat_count; beat = beat + 1) begin
-        scan_result = $fscanf(input_file, "%h\n", beat_data);
-        if (scan_result != 1)
-          $fatal(1, "Missing message %0d beat %0d", message, beat);
-        beat_bytes = remaining_bytes > 64 ? 64 : remaining_bytes;
-        beat_keep = beat_bytes == 64 ? 64'hffffffffffffffff :
-                    ((64'h1 << beat_bytes) - 1);
-        send_beat(beat_data, beat_keep, message_address,
-                  beat == 0, beat + 1 == beat_count);
-        remaining_bytes = remaining_bytes - beat_bytes;
-      end
-
-      expected_match = 0;
-      for (chunk = 0; chunk < (words_per_message + 15) / 16;
-           chunk = chunk + 1) begin
-        poll(8'hc8, 32'h00010101, 32'h00000100);
-        axi_read(8'hc0, result_address_low);
-        axi_read(8'hc4, result_address_high);
-        if ({result_address_high, result_address_low} !== message_address)
-          $fatal(1, "Message %0d result address mismatch", message);
-
-        chunk_words = words_per_message - chunk * 16;
-        if (chunk_words > 16) chunk_words = 16;
-        for (word = 0; word < chunk_words; word = word + 1) begin
-          scan_result = $fscanf(expected_file, "%h\n", expected_word);
-          if (scan_result != 1)
-            $fatal(1, "Missing expected word for message %0d", message);
-          axi_read(8'h80 + word * 4, actual_word);
-          if (chunk == 0 && word == 0) expected_match = expected_word[0];
-          if ((chunk == 0 && word == 0) || expected_match) begin
-            if (actual_word !== expected_word)
-              $fatal(1,
-                     "Result mismatch message=%0d word=%0d expected=%h actual=%h",
-                     message, chunk * 16 + word, expected_word, actual_word);
-          end
-        end
-
-        axi_write(8'h18, 1);
-        poll(8'hc8, 32'h00010101, 32'h00000001);
-        axi_write(8'h18, 0);
-        if (chunk + 1 == (words_per_message + 15) / 16)
-          poll(8'hc8, 32'h00010101, 0);
-      end
-    end
+    fork
+      drive_messages();
+      check_results();
+    join
+    wait_for_performance_records();
+    if (telemetry_correlator_drops != 0)
+      $fatal(1, "Performance telemetry dropped %0d correlation events",
+             telemetry_correlator_drops);
 
     $fclose(input_file);
     $fclose(expected_file);
+    $fflush(cycle_file);
+    $fclose(cycle_file);
+    $display("C/RTL cycle summary: records=%0d regexVM_cycles[min=%0d avg=%0d max=%0d] kernel_cycles[min=%0d avg=%0d max=%0d]",
+             perf_message_records,
+             min_regexvm_cycles,
+             total_regexvm_cycles / perf_message_records,
+             max_regexvm_cycles,
+             min_kernel_cycles,
+             total_kernel_cycles / perf_message_records,
+             max_kernel_cycles);
     $display("PASS C/RTL log regression: %0d messages matched the test.cpp reference",
              message_count);
     $finish;

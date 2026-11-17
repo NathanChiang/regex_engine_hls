@@ -256,8 +256,12 @@ int main(int argc, const char* argv[]) {
 
     expected << messages.size() << ' ' << words_per_message << '\n';
     expected << std::hex << std::setfill('0');
-    for (unsigned int i = 0; i < reference.size(); ++i)
-        expected << std::setw(8) << reference[i] << '\n';
+    for (unsigned int m = 0; m < messages.size(); ++m) {
+        expected << std::setw(16) << messages[m].address << '\n';
+        for (unsigned int word = 0; word < words_per_message; ++word)
+            expected << std::setw(8)
+                     << reference[m * words_per_message + word] << '\n';
+    }
 
     std::cout << "Generated C/RTL vectors: messages=" << messages.size()
               << ", instructions=" << instruction_count

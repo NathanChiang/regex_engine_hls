@@ -21,6 +21,8 @@ RE_HLS_ACTION=synth_only vitis_hls -f run_hls.tcl # skip long C regression
 # then drive the generated RTL through its real AXI-Lite and AXIS interfaces:
 RE_HLS_ACTION=cosim RE_HLS_COSIM_LINES=1000 vitis_hls -f run_hls.tcl
 RE_HLS_ACTION=cosim_only RE_HLS_COSIM_LINES=1000 vitis_hls -f run_hls.tcl # reuse existing csynth RTL
+# Complete access_5k.log regression:
+RE_HLS_ACTION=cosim RE_HLS_COSIM_LINES=5000 vitis_hls -f run_hls.tcl
 
 # Synthesized three-rule/three-message-length performance matrix:
 RE_HLS_ACTION=perf vitis_hls -f run_hls.tcl
@@ -45,6 +47,19 @@ The `synth_only` report is under `build/re_engine_direct/smoke/syn/report/`.
 The direct RTL bus test logs are under `build/mmio_<project>/`.
 The log-data C/RTL regression logs and vectors are under
 `build/cosim_re_engine_cosim/`.
+The runner prints each compile/simulation stage plus a 30-second heartbeat;
+`xsim_console.log` reports checked-message progress every 100 records. DMA
+input and ordered result checking run concurrently so the RTL regression can
+keep the sixteen processing units in flight instead of serializing messages.
+Each run also writes `re_engine_kernel_cycles.csv`. Its `regexVM_cycles`
+column is the synthesized VM compute-done minus compute-start interval, which
+matches the execution-cycle definition used by the regexVM RTL unit tests.
+Its `kernel_cycles` column is result-buffered minus DMA-SOP time and therefore
+includes the full kernel lookup, scheduling, PU loading, VM execution, and
+result-buffering path. The simulator prints min/average/max values for both.
+The cycle-reporting bench permits sixteen unreported messages in flight—one
+per PU—so telemetry remains complete instead of reusing correlation slots;
+the run fails if any timing record or correlation event is dropped.
 The finite C step model is not an RTL co-simulation reference for the
 free-running datapath; the `cosim` action and `run_rtl_mmio.py` both drive the
 post-synthesis RTL directly.

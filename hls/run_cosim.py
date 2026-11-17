@@ -172,8 +172,22 @@ def main():
     if not cycle_report.exists():
         sys.exit("C/RTL regression did not create cycle report: " +
                  str(cycle_report))
+    stall_report = work / "re_engine_kernel_stalls.csv"
+    if not stall_report.exists():
+        sys.exit("C/RTL regression did not create stall report: " +
+                 str(stall_report))
+    with (work / "cosim_input.txt").open() as vectors:
+        expected_records = int(vectors.readline().split()[1])
+    with cycle_report.open() as report:
+        cycle_records = sum(1 for _ in report) - 1
+    with stall_report.open() as report:
+        stall_records = sum(1 for _ in report) - 1
+    if cycle_records != expected_records or stall_records != expected_records:
+        sys.exit("Incomplete C/RTL reports: expected={} cycles={} stalls={}".
+                 format(expected_records, cycle_records, stall_records))
     print(pass_lines[-1])
     print("Cycle report: " + str(cycle_report))
+    print("Stall report: " + str(stall_report))
 
 
 if __name__ == "__main__":

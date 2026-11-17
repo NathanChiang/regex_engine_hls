@@ -51,14 +51,23 @@ The runner prints each compile/simulation stage plus a 30-second heartbeat;
 `xsim_console.log` reports checked-message progress every 100 records. DMA
 input and ordered result checking run concurrently so the RTL regression can
 keep the sixteen processing units in flight instead of serializing messages.
+The producer holds `TVALID` continuously across adjacent beats and messages;
+only RTL `TREADY` backpressure or the full 64-entry correlation/reorder window
+can pause it. Each message prints its source-wait and DMA-stall reason, and the
+same records are written to `re_engine_kernel_stalls.csv`. A
+`telemetry_correlation_window` source wait is testbench pacing at the 64-message
+safety limit; DMA stall cycles are only clocks with `TVALID && !TREADY`.
 Each run also writes `re_engine_kernel_cycles.csv`. Its `regexVM_cycles`
-column is the synthesized VM compute-done minus compute-start interval, which
-matches the execution-cycle definition used by the regexVM RTL unit tests.
+column is the synthesized compute-done minus compute-start interval. In the
+current RTL schedule that interval also contains the fixed capture-offset
+initialization immediately before the VM, so it is a PU setup-plus-VM metric,
+not the standalone regexVM `ap_start`-to-`ap_done` interval.
 Its `kernel_cycles` column is result-buffered minus DMA-SOP time and therefore
 includes the full kernel lookup, scheduling, PU loading, VM execution, and
-result-buffering path. The simulator prints min/average/max values for both.
-The cycle-reporting bench permits sixteen unreported messages in flight—one
-per PU—so telemetry remains complete instead of reusing correlation slots;
+result-buffering path. The simulator prints min/average/max values for both,
+plus separate one-time setup, processing, and total execution times.
+The cycle-reporting bench permits 64 unreported messages in flight, matching
+the hardware correlation/reorder capacity, so telemetry remains complete;
 the run fails if any timing record or correlation event is dropped.
 The finite C step model is not an RTL co-simulation reference for the
 free-running datapath; the `cosim` action and `run_rtl_mmio.py` both drive the

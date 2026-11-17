@@ -4,10 +4,14 @@
 `timescale 1ns/1ps
 
 module test_cosim;
-  localparam integer PERF_INFLIGHT_LIMIT = 16;
+  // The synthesized reorder/correlation path has 64 slots. Use the complete
+  // window so the source can keep all 16 PUs busy without allowing a message
+  // ID to reuse a telemetry slot before its previous record is emitted.
+  localparam integer PERF_INFLIGHT_LIMIT = 64;
+  localparam real CLOCK_PERIOD_NS = 6.0;
 
   reg clk = 0;
-  always #4.5 clk = ~clk;
+  always #(CLOCK_PERIOD_NS / 2.0) clk = ~clk;
 
   reg reset_n = 0;
   reg [7:0] awaddr = 0;
@@ -34,6 +38,9 @@ module test_cosim;
   wire [511:0] perf_tdata;
   wire perf_tvalid;
   wire perf_tready = 1'b1;
+
+  integer sim_cycle = 0;
+  always @(posedge clk) sim_cycle <= sim_cycle + 1;
 
   reEngineKernel dut (
     .ap_clk(clk),
@@ -165,8 +172,10 @@ module test_cosim;
                            input [63:0] keep,
                            input [63:0] address,
                            input first,
-                           input last);
+                           input last,
+                           output integer stall_cycles);
     begin
+      stall_cycles = 0;
       @(negedge clk);
       tdata = data;
       tkeep = keep;
@@ -174,9 +183,13 @@ module test_cosim;
       tlast = last;
       tvalid = 1;
       @(posedge clk);
-      while (!tready) @(posedge clk);
-      @(negedge clk);
-      tvalid = 0;
+      while (tready !== 1'b1) begin
+        stall_cycles = stall_cycles + 1;
+        @(posedge clk);
+      end
+      // Keep TVALID asserted. The producer installs the next beat on the
+      // immediately following falling edge, allowing consecutive beats and
+      // consecutive messages to be accepted on consecutive rising edges.
     end
   endtask
 
@@ -190,8 +203,23 @@ module test_cosim;
   integer expected_words_per_message;
   integer word;
   integer cycle_file;
+  integer stall_file;
   integer perf_message_records = 0;
   integer perf_snapshot_records = 0;
+  integer setup_start_cycle = 0;
+  integer processing_start_cycle = 0;
+  integer processing_end_cycle = 0;
+  realtime setup_start_time = 0.0;
+  realtime processing_start_time = 0.0;
+  realtime processing_end_time = 0.0;
+  integer total_dma_stall_cycles = 0;
+  integer total_dma_stall_events = 0;
+  integer total_source_wait_cycles = 0;
+  integer messages_with_dma_stalls = 0;
+  integer total_message_bytes = 0;
+  integer total_dma_beats = 0;
+  integer first_dma_accept_cycle = -1;
+  integer last_dma_accept_cycle = -1;
   reg [63:0] configuration_word;
   reg [39:0] current_regexvm_cycles;
   reg [39:0] current_kernel_cycles;
@@ -205,15 +233,20 @@ module test_cosim;
 
   initial begin
     cycle_file = $fopen("re_engine_kernel_cycles.csv", "w");
-    if (!cycle_file) $fatal(1, "Cannot create re_engine_kernel_cycles.csv");
+    stall_file = $fopen("re_engine_kernel_stalls.csv", "w");
+    if (!cycle_file || !stall_file)
+      $fatal(1, "Cannot create C/RTL timing reports");
     $fdisplay(cycle_file,
       "message_id,job_id,processing_unit,message_bytes,rule_bytes,dma_beats,regexVM_cycles,kernel_cycles,sop_cycle,iova_cycle,rule_cycle,ready_cycle,dispatch_cycle,pu_input_cycle,compute_start_cycle,compute_done_cycle,result_cycle,iova_cycles,rule_lookup_cycles,join_cycles,scheduler_cycles,pu_load_cycles,result_buffer_cycles,correlator_drops");
+    $fdisplay(stall_file,
+      "message_id,message_bytes,dma_beats,source_wait_cycles,dma_stall_events,dma_stall_cycles,boundary_stall_cycles,payload_stall_cycles,source_reason,dma_reason");
   end
 
-  // The regexVM unit bench measures ap_start -> ap_done.  The synthesized
-  // full kernel exposes the corresponding VM compute-start/compute-done
-  // timestamps in each type-1 performance record.  It also exposes DMA SOP
-  // through result-buffered timestamps for a true full-kernel cycle count.
+  // The synthesized full kernel exposes compute-start/compute-done timestamps
+  // in each type-1 performance record. The current HLS schedule places the
+  // start marker before capture-offset initialization, so regexVM_cycles is a
+  // PU setup-plus-VM interval. DMA SOP through result-buffered timestamps is
+  // still the complete per-message kernel latency.
   always @(posedge clk) begin
     if (perf_tvalid && perf_tready) begin
       if (perf_tdata[3:0] == 1) begin
@@ -273,18 +306,45 @@ module test_cosim;
     integer producer_beat_count;
     integer producer_remaining_bytes;
     integer producer_beat_bytes;
+    integer producer_beat_stall_cycles;
+    integer producer_source_wait_cycles;
+    integer producer_message_stall_cycles;
+    integer producer_message_stall_events;
+    integer producer_boundary_stall_cycles;
+    integer producer_payload_stall_cycles;
     reg [63:0] producer_message_address;
     reg [511:0] producer_beat_data;
     reg [63:0] producer_beat_keep;
+    reg [8*64-1:0] producer_source_reason;
+    reg [8*64-1:0] producer_dma_reason;
     begin
       for (producer_message = 0; producer_message < message_count;
            producer_message = producer_message + 1) begin
-        // The performance channel is deliberately nonblocking. Keep enough
-        // work in flight to occupy all PUs, but do not reuse a telemetry
-        // correlation slot before its record has been emitted.
+        producer_source_wait_cycles = 0;
+        producer_message_stall_cycles = 0;
+        producer_message_stall_events = 0;
+        producer_boundary_stall_cycles = 0;
+        producer_payload_stall_cycles = 0;
+
+        // Functional backpressure is expressed through TREADY. The only
+        // source-side limit is the full 64-entry telemetry/reorder window.
+        // Drop TVALID before waiting so the previously accepted final beat
+        // cannot be sampled a second time.
+        if (producer_message - perf_message_records >=
+            PERF_INFLIGHT_LIMIT) begin
+          @(negedge clk);
+          tvalid = 0;
+          tlast = 0;
+          tuser = 0;
+        end
         while (producer_message - perf_message_records >=
-               PERF_INFLIGHT_LIMIT)
+               PERF_INFLIGHT_LIMIT) begin
           @(posedge clk);
+          producer_source_wait_cycles = producer_source_wait_cycles + 1;
+        end
+        total_source_wait_cycles = total_source_wait_cycles +
+                                   producer_source_wait_cycles;
+
         producer_scan_result = $fscanf(input_file, "%d %h %d\n",
                                        producer_message_length,
                                        producer_message_address,
@@ -307,11 +367,72 @@ module test_cosim;
                                ((64'h1 << producer_beat_bytes) - 1);
           send_beat(producer_beat_data, producer_beat_keep,
                     producer_message_address, producer_beat == 0,
-                    producer_beat + 1 == producer_beat_count);
+                    producer_beat + 1 == producer_beat_count,
+                    producer_beat_stall_cycles);
+
+          if (first_dma_accept_cycle < 0)
+            first_dma_accept_cycle = sim_cycle;
+          last_dma_accept_cycle = sim_cycle;
+          total_dma_beats = total_dma_beats + 1;
+          if (producer_beat_stall_cycles != 0) begin
+            producer_message_stall_events =
+              producer_message_stall_events + 1;
+            producer_message_stall_cycles =
+              producer_message_stall_cycles + producer_beat_stall_cycles;
+            total_dma_stall_events = total_dma_stall_events + 1;
+            total_dma_stall_cycles = total_dma_stall_cycles +
+                                     producer_beat_stall_cycles;
+            if (producer_beat == 0)
+              producer_boundary_stall_cycles =
+                producer_boundary_stall_cycles +
+                producer_beat_stall_cycles;
+            else
+              producer_payload_stall_cycles =
+                producer_payload_stall_cycles +
+                producer_beat_stall_cycles;
+          end
           producer_remaining_bytes = producer_remaining_bytes -
                                      producer_beat_bytes;
         end
+
+        total_message_bytes = total_message_bytes + producer_message_length;
+        if (producer_message_stall_cycles != 0)
+          messages_with_dma_stalls = messages_with_dma_stalls + 1;
+
+        producer_source_reason = producer_source_wait_cycles == 0 ?
+                                 "none" :
+                                 "telemetry_correlation_window";
+        if (producer_boundary_stall_cycles == 0 &&
+            producer_payload_stall_cycles == 0)
+          producer_dma_reason = "none";
+        else if (producer_payload_stall_cycles == 0)
+          producer_dma_reason =
+            "packet_boundary_or_descriptor_queue_backpressure";
+        else if (producer_boundary_stall_cycles == 0)
+          producer_dma_reason = "payload_queue_backpressure";
+        else
+          producer_dma_reason = "mixed_boundary_and_payload_backpressure";
+
+        $fdisplay(stall_file,
+          "%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0s,%0s",
+          producer_message, producer_message_length, producer_beat_count,
+          producer_source_wait_cycles, producer_message_stall_events,
+          producer_message_stall_cycles, producer_boundary_stall_cycles,
+          producer_payload_stall_cycles, producer_source_reason,
+          producer_dma_reason);
+        $display(
+          "C/RTL ingress: message=%0d bytes=%0d beats=%0d source_wait_cycles=%0d source_reason=%0s dma_stall_events=%0d dma_stall_cycles=%0d dma_reason=%0s",
+          producer_message, producer_message_length, producer_beat_count,
+          producer_source_wait_cycles, producer_source_reason,
+          producer_message_stall_events, producer_message_stall_cycles,
+          producer_dma_reason);
       end
+
+      @(negedge clk);
+      tvalid = 0;
+      tlast = 0;
+      tuser = 0;
+      $fflush(stall_file);
     end
   endtask
 
@@ -399,6 +520,8 @@ module test_cosim;
   endtask
 
   initial begin
+    setup_start_cycle = sim_cycle;
+    setup_start_time = $realtime;
     input_file = $fopen("cosim_input.txt", "r");
     expected_file = $fopen("cosim_expected.txt", "r");
     if (!input_file || !expected_file)
@@ -448,6 +571,13 @@ module test_cosim;
     axi_write(8'h20, 0);
     poll(8'h10, 32'h01010000, 32'h01010000);
 
+    processing_start_cycle = sim_cycle;
+    processing_start_time = $realtime;
+    $display(
+      "C/RTL setup complete: setup_cycles=%0d setup_time_ns=%0.3f",
+      processing_start_cycle - setup_start_cycle,
+      processing_start_time - setup_start_time);
+
     fork
       drive_messages();
       check_results();
@@ -457,10 +587,15 @@ module test_cosim;
       $fatal(1, "Performance telemetry dropped %0d correlation events",
              telemetry_correlator_drops);
 
+    processing_end_cycle = sim_cycle;
+    processing_end_time = $realtime;
+
     $fclose(input_file);
     $fclose(expected_file);
     $fflush(cycle_file);
     $fclose(cycle_file);
+    $fflush(stall_file);
+    $fclose(stall_file);
     $display("C/RTL cycle summary: records=%0d regexVM_cycles[min=%0d avg=%0d max=%0d] kernel_cycles[min=%0d avg=%0d max=%0d]",
              perf_message_records,
              min_regexvm_cycles,
@@ -469,6 +604,21 @@ module test_cosim;
              min_kernel_cycles,
              total_kernel_cycles / perf_message_records,
              max_kernel_cycles);
+    $display(
+      "C/RTL execution time: setup_cycles=%0d processing_cycles=%0d total_cycles=%0d setup_time_ns=%0.3f processing_time_ns=%0.3f total_time_ns=%0.3f nominal_clock_period_ns=%0.3f",
+      processing_start_cycle - setup_start_cycle,
+      processing_end_cycle - processing_start_cycle,
+      processing_end_cycle - setup_start_cycle,
+      processing_start_time - setup_start_time,
+      processing_end_time - processing_start_time,
+      processing_end_time - setup_start_time,
+      CLOCK_PERIOD_NS);
+    $display(
+      "C/RTL DMA feed summary: messages=%0d bytes=%0d beats=%0d feed_cycles=%0d source_wait_cycles=%0d dma_stall_events=%0d dma_stall_cycles=%0d messages_with_dma_stalls=%0d",
+      message_count, total_message_bytes, total_dma_beats,
+      last_dma_accept_cycle - first_dma_accept_cycle + 1,
+      total_source_wait_cycles, total_dma_stall_events,
+      total_dma_stall_cycles, messages_with_dma_stalls);
     $display("PASS C/RTL log regression: %0d messages matched the test.cpp reference",
              message_count);
     $finish;

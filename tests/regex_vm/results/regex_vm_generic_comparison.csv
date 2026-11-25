@@ -1,0 +1,16 @@
+family,bytes,expected_match,original_actual_match,original_correct,original_opt_cycles,new_cycles,speedup
+class-greedy,2,1,1,1,31,47,0.6596
+class-greedy,26,1,1,1,175,53,3.3019
+class-greedy,4088,1,1,1,24547,1067,23.0056
+class-possessive,2,0,0,1,28,23,1.2174
+class-possessive,26,0,1,0,178,29,
+class-possessive,4088,0,1,0,24550,1043,
+literal-chain,71,1,1,1,97,113,0.8584
+scalar-class-chain,28,1,1,1,94,197,0.4772
+scalar-class-chain,29,0,0,1,91,191,0.4764
+star-control-suffix,0,0,0,1,13,29,0.4483
+star-control-suffix,64,1,1,1,220,77,2.8571
+star-control-suffix,4088,1,1,1,12292,1085,11.329
+bounded-repeat,2,0,0,1,16,35,0.4571
+bounded-repeat,5,1,1,1,31,89,0.3483
+bounded-repeat,8,0,0,1,37,101,0.3663

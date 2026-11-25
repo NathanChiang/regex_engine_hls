@@ -1,0 +1,1 @@
+\A[\s\S]*(?:[vV][aA][rR][cC][hH][aA][rR]\(|[eE][xX][eE][cC]\(|[lL][oO][aA][dD]_[fF][iI][lL][eE]\(|[sS][pP]_[cC][oO][nN][fF][iI][gG][uU][rR][eE]|[vV][aA][rR][cC][hH][aA][rR]2\()

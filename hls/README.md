@@ -146,7 +146,10 @@ keeps it asserted. Up to 64 messages may be in flight.
   AXIS `TREADY` supplies input backpressure when necessary.
 - `perf_out` carries diagnostic message-timing and engine-snapshot records; it
   does not replace the MMIO match-result interface.
-- `regexVM_opt` pipelines VM loop iterations at II=3; it does not expose three
+- The streaming worker uses `regexVM_new` with configuration-time instruction
+  descriptors and wide message/class memories. Its requested VM II is 6;
+  see [the optimization and validation notes](regexVM_new_optimization.md).
+  The original `regexVM_opt` baseline requests II=3. Neither VM exposes multiple
   independent message slots. A PU is reusable only after its VM call and
   result copy finish, so its message and capture buffers are no longer in use.
 - In hardware, start the AXI-Lite-controlled kernel once (`ap_ctrl_hs`) after
@@ -173,7 +176,7 @@ keeps it asserted. Up to 64 messages may be in flight.
   `cmd_transition_allowed` before switching commands. Preserve a software
   timeout: malformed ranges/invalid job IDs retain the existing no-ack
   rejection behavior.
-- Rule IDs are 0..31, each with 256 64-bit words. Missing words read as zero,
+- Rule IDs are 0..15, each with 256 64-bit words. Missing words read as zero,
   including after delete/reallocate. Headers must have a nonzero instruction
   count and group count, bounded class/group counts, and exactly
   `2 + instructions + 4*classes` words, at most 256. Malformed headers are

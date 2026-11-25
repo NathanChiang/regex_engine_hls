@@ -23,7 +23,7 @@
 
 #include "hls_stream.h"
 #include "ap_int.h"
-#include "xf_data_analytics/text/regexVM.hpp"
+#include "xf_data_analytics/text/regexVM_new.hpp"
 
 namespace xf {
 namespace data_analytics {
@@ -188,7 +188,7 @@ void readMsg512ToBuff(ap_uint<16> len, hls::stream<ap_uint<512> >& msg_strm, ap_
     }
 }
 
-template <int STACK_SIZE>
+template <int STACK_SIZE, int INSTR_DEPTH = 256>
 void reExecOneMessage(ap_uint<16>* mem_oft_buff,
                       ap_uint<64>* instr_buff,
                       ap_uint<32>* bitset_buff,
@@ -196,10 +196,38 @@ void reExecOneMessage(ap_uint<16>* mem_oft_buff,
                       unsigned int msg_len) {
     ap_uint<2> match = 3;
     if (msg_len > 0) {
-        xf::data_analytics::text::regexVM_opt<STACK_SIZE>(bitset_buff, instr_buff, msg_buff, msg_len, match,
-                                                          mem_oft_buff + 3);
+        xf::data_analytics::text::regexVM_new<STACK_SIZE, INSTR_DEPTH>(bitset_buff, instr_buff, msg_buff, msg_len,
+                                                                      match, mem_oft_buff + 3);
     }
 
+    mem_oft_buff[1] = match;
+    mem_oft_buff[2] = 0;
+}
+
+// Keep DMA beats wide all the way to the VM. This removes the sixteen-cycle
+// serialization of each beat and supplies a 24-byte window with two reads.
+template <int MSG_LEN>
+void readMsg512ToWideBuff(ap_uint<16> len, hls::stream<ap_uint<512> >& msg_strm,
+                          ap_uint<512> msg_buff[(MSG_LEN + 7) / 8]) {
+    unsigned int beats = ((unsigned int)len + 63) >> 6;
+    for (unsigned int i = 0; i < beats; ++i) {
+#pragma HLS pipeline II = 1
+        msg_buff[i] = msg_strm.read();
+    }
+    // The VM bounds every read and every consumed byte against len. Padding
+    // and data left by an earlier, longer message are never examined as input.
+}
+
+template <int STACK_SIZE, int INSTR_DEPTH = 256>
+void reExecOneMessage(ap_uint<16>* mem_oft_buff,
+                      ap_uint<512>* instr_buff,
+                      ap_uint<256>* bitset_buff,
+                      ap_uint<512>* msg_buff,
+                      unsigned int msg_len) {
+    ap_uint<2> match = 3;
+    if (msg_len > 0)
+        xf::data_analytics::text::regexVM_new_predecoded<STACK_SIZE, INSTR_DEPTH>(
+            bitset_buff, instr_buff, msg_buff, msg_len, match, mem_oft_buff + 3);
     mem_oft_buff[1] = match;
     mem_oft_buff[2] = 0;
 }
@@ -240,7 +268,7 @@ void reExecIndependentBlock(ap_uint<16> cpgp_nm,
 
             state = RE_BLK_BUSY;
             readMsg512ToBuff<MSG_LEN>(len, msg_strm, msg_buff);
-            reExecOneMessage<STACK_SIZE>(mem_oft_buff, instr_buff, bitset_buff, msg_buff, len);
+            reExecOneMessage<STACK_SIZE, INSTR_DEPTH>(mem_oft_buff, instr_buff, bitset_buff, msg_buff, len);
 
             state = RE_BLK_COLLECTING;
             for (int g = 0; g < cpgp_nm + 1; ++g) {

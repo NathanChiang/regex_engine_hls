@@ -7,8 +7,8 @@ No implementation/place-and-route or board is needed. Each tool is time-bounded.
 import pathlib
 import os
 import shutil
-import subprocess
 import sys
+from run_cosim import run_logged
 
 here = pathlib.Path(__file__).resolve().parent
 project_name = os.environ.get("RE_HLS_RTL_PROJECT", "re_engine")
@@ -29,16 +29,15 @@ project.append('sv xil_defaultlib "' + (here / "tb_mmio.sv").as_posix() + '"')
 (work / "mmio.prj").write_text("\n".join(project) + "\n")
 (work / "run.tcl").write_text("run all\nquit\n")
 defines = ["-d", "RE_HLS_RTL_QUICK"] if os.environ.get("RE_HLS_RTL_QUICK") == "1" else []
+simulation_timeout = int(os.environ.get("RE_HLS_RTL_TIMEOUT", "1800"))
 for tool, args in [("xvlog", defines + ["-prj", "mmio.prj"]),
                    ("xelab", ["xil_defaultlib.tb_mmio", "-s", "mmio", "-mt", "2"]),
                    ("xsim", ["mmio", "-tclbatch", "run.tcl"])]:
     exe = shutil.which(tool)
     if not exe:
         sys.exit("Cannot find " + tool + "; source Vivado 2021.2 settings64 first")
-    print("Running " + tool, flush=True)
-    with (work / (tool + "_console.log")).open("w") as log:
-        subprocess.run([exe] + args, cwd=str(work), stdout=log, stderr=subprocess.STDOUT,
-                       check=True, timeout=600)
+    run_logged([exe] + args, work, work / (tool + "_console.log"),
+               timeout=simulation_timeout if tool == "xsim" else 600)
 log = (work / "xsim_console.log").read_text()
 if "PASS production RTL" not in log or "Fatal:" in log:
     sys.exit("RTL test failed: inspect " + str(work / "xsim_console.log"))

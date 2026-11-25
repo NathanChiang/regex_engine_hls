@@ -1,6 +1,7 @@
 /hls/build/
 /tests/regex_vm/build/
 /tests/regex_vm/settings.tcl
+__pycache__/
 /re_compile/oniguruma/
 /re_compile/lib/
 /log_data/*.log

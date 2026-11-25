@@ -42,9 +42,11 @@ typedef ap_axiu<RE_DMA_DATA_WIDTH, 65, 0, 0> DmaAxisBeat;
 // Configuration is acknowledged only after all PUs have applied this update.
 struct ReRuleUpdate {
     ap_uint<4> rule;
-    ap_uint<1> bitset;
+    ap_uint<2> bitset; // 0: instruction, 1: character class, 2: finalize only
     ap_uint<9> index;
     ap_uint<64> data;
+    ap_uint<1> finalize;
+    ap_uint<9> instruction_count;
 };
 
 struct cfg_input {

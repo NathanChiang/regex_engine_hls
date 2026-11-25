@@ -74,6 +74,8 @@ inline bool decodeCFGbuf(ap_uint<4> entry,
                          ap_uint<64> word,
                          ReRuleUpdate& update) {
 #pragma HLS inline
+    update.finalize = 0;
+    update.instruction_count = 0;
     if (word_index < 2 || !re_rule_word_valid[entry][1])
         return false;
 
@@ -254,18 +256,29 @@ inline void re_engine_rule_table(
                 re_rule_table_internal::re_rule_cclass_count[target_index] = cfg_in.arg1.range(47, 32);
                 re_rule_table_internal::re_rule_cpgp_count[target_index] = cfg_in.arg1.range(63, 48);
             } else {
-#ifdef __SYNTHESIS__
-                ReRuleUpdate update;
-                if (re_rule_table_internal::decodeCFGbuf(
-                        target_index, word_index, cfg_in.arg1, update)) {
-                    pending_update = update;
-                    state = RULE_SEND_UPDATE;
-                    break;
-                }
-#else
+#ifndef __SYNTHESIS__
                 re_rule_table_internal::readCFGbuf(target_index, word_index, cfg_in.arg1);
 #endif
             }
+
+#ifdef __SYNTHESIS__
+            ReRuleUpdate update;
+            bool payload = re_rule_table_internal::decodeCFGbuf(target_index, word_index, cfg_in.arg1, update);
+            bool finalize = re_rule_table_internal::config_valid(target_index);
+            if (payload || finalize) {
+                if (!payload) {
+                    update.rule = target_index;
+                    update.bitset = 2;
+                    update.index = 0;
+                    update.data = 0;
+                }
+                update.finalize = finalize;
+                update.instruction_count = re_rule_table_internal::re_rule_instr_count[target_index];
+                pending_update = update;
+                state = RULE_SEND_UPDATE;
+                break;
+            }
+#endif
 
             status.ack = 1;
             status.full = table_full;

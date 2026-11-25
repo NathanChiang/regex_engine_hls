@@ -251,12 +251,18 @@ void processingUnit(hls::stream<ReRuleUpdate>& rule_updates,
                     hls::stream<RePerfEvent>& perf_events) {
     // A rule is configured once, directly into every PU's private memories.
     // Runtime dispatch passes only the rule index; no rule is copied per job.
-    ap_uint<64> instruction_rules[RE_RULE_TABLE_ENTRIES][RE_RULE_INSTR_DEPTH];
+    // Configuration retains compact bytecode and compiles one descriptor per
+    // PC after the final missing rule word arrives. Runtime needs one read.
+    ap_uint<64> instruction_raw[RE_RULE_TABLE_ENTRIES][RE_RULE_INSTR_DEPTH];
+#pragma HLS bind_storage variable=instruction_raw type=ram_2p impl=uram
+    ap_uint<512> instruction_rules[RE_RULE_TABLE_ENTRIES][RE_RULE_INSTR_DEPTH];
 #pragma HLS bind_storage variable=instruction_rules type=ram_2p impl=uram
-    ap_uint<32> bitset_rules[RE_RULE_TABLE_ENTRIES][RE_RULE_BITSET_DEPTH];
+    ap_uint<256> bitset_rules[RE_RULE_TABLE_ENTRIES][RE_RULE_BITSET_DEPTH / 8];
 #pragma HLS bind_storage variable=bitset_rules type=ram_2p impl=bram
-    ap_uint<32> message[MSG_LEN * 2];
-#pragma HLS bind_storage variable=message type=ram_t2p impl=bram
+    ap_uint<512> message[(MSG_LEN + 7) / 8];
+    // The 64-row window is too shallow to use wide true-dual-port BRAM
+    // efficiently. Two-read distributed RAM trades spare LUTs for BRAM.
+#pragma HLS bind_storage variable=message type=ram_2p impl=lutram
     ap_uint<16> offsets[CPGP_NM * 2 + 4];
 #pragma HLS bind_storage variable=offsets type=ram_t2p impl=bram
 
@@ -264,11 +270,20 @@ void processingUnit(hls::stream<ReRuleUpdate>& rule_updates,
         ReRuleUpdate update;
         ReStreamJob job;
         if (rule_updates.read_nb(update)) {
-            if (update.bitset) {
-                bitset_rules[update.rule][update.index] = update.data.range(31, 0);
-                bitset_rules[update.rule][update.index + 1] = update.data.range(63, 32);
-            } else {
-                instruction_rules[update.rule][update.index] = update.data;
+            if (update.bitset == 1) {
+                ap_uint<6> class_index = update.index >> 3;
+                ap_uint<256> previous = bitset_rules[update.rule][class_index];
+                bitset_rules[update.rule][class_index] =
+                    xf::data_analytics::text::internal_new::replaceClassChunk(
+                        previous, update.index.range(2, 1), update.data);
+            } else if (update.bitset == 0) {
+                instruction_raw[update.rule][update.index] = update.data;
+            }
+            if (update.finalize) {
+                // Ack follows compilation in every PU, including complete
+                // rule rewrites and payload words received out of order.
+                xf::data_analytics::text::internal_new::prepareRule<RE_RULE_INSTR_DEPTH>(
+                    instruction_raw[update.rule], instruction_rules[update.rule], update.instruction_count);
             }
             rule_update_done.write(true);
         } else if (jobs.read_nb(job)) {
@@ -282,16 +297,18 @@ void processingUnit(hls::stream<ReRuleUpdate>& rule_updates,
             perf_event.dma_beats = job.beats;
             perf_events.write_nb(perf_event);
 
-            xf::data_analytics::text::internal::readMsg512ToBuff<MSG_LEN>(
+            xf::data_analytics::text::internal::readMsg512ToWideBuff<MSG_LEN>(
                 job.length, messages, message);
-            for (int i = 0; i < CPGP_NM + 2; ++i) {
+            // Only the configured groups (plus the result prefix) are visible
+            // to this job. Clear them on every reuse, including rule changes.
+            for (int i = 0; i < job.groups + 2; ++i) {
 #pragma HLS pipeline II=1
                 offsets[2 * i] = -1;
                 offsets[2 * i + 1] = -1;
             }
             perf_event.flags = RE_PERF_COMPUTE_START;
             perf_events.write_nb(perf_event);
-            xf::data_analytics::text::internal::reExecOneMessage<STACK_SIZE>(
+            xf::data_analytics::text::internal::reExecOneMessage<STACK_SIZE, RE_RULE_INSTR_DEPTH>(
                 offsets, instruction_rules[job.rule], bitset_rules[job.rule],
                 message, job.length);
             perf_event.flags = RE_PERF_COMPUTE_DONE;
@@ -366,7 +383,10 @@ void collectResults(hls::stream<ReStreamOrder>& order,
     static ap_uint<32> result_buffer[SLOT_NM][WORD_NM];
 #pragma HLS bind_storage variable=result_buffer type=ram_t2p impl=uram
     static ap_uint<32> slot_id[SLOT_NM];
-    static ap_uint<1> slot_valid[SLOT_NM];
+    // Only the validity RAM needs reset initialization. Payload/tag RAM can
+    // retain its contents because every entry remains masked until recaptured.
+    static ap_uint<1> slot_valid[SLOT_NM] = {};
+#pragma HLS reset variable=slot_valid
 #pragma HLS dependence variable=slot_id inter false
 #pragma HLS dependence variable=slot_valid inter false
 
@@ -435,8 +455,10 @@ void collectResults(hls::stream<ReStreamOrder>& order,
 
         if (retire_active) {
             ap_uint<6> slot = retire_ticket.message_id.range(5, 0);
-            bool ready = slot_valid[slot] &&
-                         slot_id[slot] == retire_ticket.message_id;
+            // Both reads are safe regardless of validity. Evaluate them in
+            // parallel rather than placing the tag read behind the flag read.
+            bool ready = (bool)slot_valid[slot] &
+                         (slot_id[slot] == retire_ticket.message_id);
             if (ready && !retire_header_sent) {
                 if (output_order.write_nb(retire_ticket))
                     retire_header_sent = 1;
@@ -630,7 +652,14 @@ void monitorPerformance(hls::stream<ReTimedPerfEvent>& capture_events,
     static ap_uint<32> scheduler_wait_cycles = 0;
     static ap_uint<16> correlator_drops = 0;
     static ap_uint<16> completed_messages = 0;
-    static ap_uint<6> scan_slot = 0;
+    // Emit message records in message-id order.  Besides making the telemetry
+    // deterministic, this is what makes the 64-entry modulo table safe: the
+    // CoSim producer limits itself to 64 messages beyond the number of emitted
+    // records, so slot N is retired before message N + 64 can be accepted.
+    // A round-robin scan could retire younger messages first, allowing that
+    // producer count to advance while the oldest slot was still live and then
+    // overwrite it when the low six message-id bits wrapped.
+    static ap_uint<32> next_record_message_id = 0;
     static ap_uint<1> snapshot_pending = 0;
     static ap_uint<32> snapshot_message_id = 0;
 
@@ -785,9 +814,11 @@ void monitorPerformance(hls::stream<ReTimedPerfEvent>& capture_events,
             snapshot.range(507, 492) = completed_messages;
             if (perf_out.write_nb(snapshot)) snapshot_pending = 0;
         } else {
-            ap_uint<6> slot = scan_slot;
+            ap_uint<6> slot = next_record_message_id.range(5, 0);
             ap_uint<8> p = slot_pu[slot];
-            bool complete = slot_valid[slot] && result_valid[slot] &&
+            bool complete = slot_valid[slot] &&
+                            slot_id[slot] == next_record_message_id &&
+                            result_valid[slot] &&
                             counter_valid[slot] &&
                             p < PU_NM && input_valid[p][slot] &&
                             compute_start_valid[p][slot] &&
@@ -820,9 +851,9 @@ void monitorPerformance(hls::stream<ReTimedPerfEvent>& capture_events,
                     slot_valid[slot] = 0;
                     result_valid[slot] = 0;
                     counter_valid[slot] = 0;
+                    next_record_message_id++;
                 }
             }
-            scan_slot++;
         }
     }
 }
@@ -846,8 +877,10 @@ void engine(hls::stream<ReRuleUpdate>& rule_updates,
     hls::stream<ReStreamJob> pu_jobs[PU_NM];
 #pragma HLS stream variable=pu_jobs depth=2
     hls::stream<ap_uint<512> > pu_messages[PU_NM];
-#pragma HLS stream variable=pu_messages depth=128
-#pragma HLS bind_storage variable=pu_messages type=fifo impl=bram
+    // One maximum-size packet is 64 beats. Each PU owns at most one active
+    // assignment; this still buffers a complete packet if its reader waits.
+#pragma HLS stream variable=pu_messages depth=64
+#pragma HLS bind_storage variable=pu_messages type=fifo impl=lutram
     hls::stream<ap_uint<32> > pu_results[PU_NM];
 #pragma HLS stream variable=pu_results depth=2048
 #pragma HLS bind_storage variable=pu_results type=fifo impl=bram

@@ -51,6 +51,45 @@ module tb_mmio;
       if (bresp !== 0) $fatal(1, "AXI write response error");
     end
   endtask
+  // A complete, out-of-order configured rule: ^[ab]*c$.
+  task configure_class_rule;
+    begin
+      command(3, 1, 0, 13);
+      command(3, 1, 8, {16'd1, 16'd1, 32'd7});
+      command(3, 1, 64, 64'h0100000000000000); // END
+      command(3, 1, 56, 64'h2400000000000000); // END_BUF
+      command(3, 1, 48, 64'h0701630000000000); // STR_N c
+      command(3, 1, 40, 64'h3a00000100000000); // JUMP 1
+      command(3, 1, 32, 64'h0e01000000000000); // CCLASS 0
+      command(3, 1, 24, 64'h3b10000400000000); // PUSH 4
+      command(3, 1, 16, 64'h2300000000000000); // BEGIN_BUF
+      command(3, 1, 96, 0);
+      command(3, 1, 88, 0);
+      command(3, 1, 80, 64'h0000000600000000); // bits a,b
+      command(3, 1, 72, 0); // final missing word triggers compilation
+      wr('h20, 0);
+    end
+  endtask
+  task check_class_result(input [31:0] expected_match, input [31:0] expected_range,
+                          input bit maximum_packet = 0);
+    reg [31:0] result_word;
+    begin
+      wr('h20, 0); // return from configuration to runtime before DMA
+      if (maximum_packet) send_max_packet(); else send_packet();
+      poll('hc8, 'h00010101, 'h00000100);
+      rd('h80, result_word);
+      if (result_word !== expected_match) $fatal(1, "Configured class rule match mismatch expected=%h got=%h", expected_match, result_word);
+      if (expected_match == 1) begin
+        rd('h84, result_word);
+        if (result_word !== expected_range) $fatal(1, "Configured class rule range mismatch expected=%h got=%h", expected_range, result_word);
+      end
+      $display("MMIO class rule verified: match=%h range=%h time=%t", expected_match, expected_range, $time);
+      wr('h18, 1); poll('hc8, 'h00010101, 1);
+      $display("MMIO class result acknowledgement raised at time=%t", $time);
+      wr('h18, 0); poll('hc8, 'h00010101, 0);
+      $display("MMIO class result retired at time=%t", $time);
+    end
+  endtask
   task rd(input [7:0] addr, output [31:0] value);
     begin
       @(negedge clk); araddr = addr; arvalid = 1;
@@ -76,12 +115,14 @@ module tb_mmio;
     reg [31:0] value;
     begin
       wr('h20, {job, 8'h00, 4'h0, cmd});
-      repeat (128) @(posedge clk);
+      // VALID remains asserted until ACK, so configuration completion uses
+      // the handshake rather than a long fixed delay for every rule word.
+      repeat (8) @(posedge clk);
       wr('h24, 0); wr('h28, a[31:0]); wr('h2c, a[63:32]);
       wr('h30, b[31:0]); wr('h34, b[63:32]);
       wr('h20, {job, 8'h01, 4'h0, cmd});
       poll('h10, 1, 1);
-      repeat (200) @(posedge clk);
+      repeat (8) @(posedge clk);
       rd('h10, value);
       if (!value[0]) $fatal(1, "Configuration ack was not held for software");
       wr('h20, {job, 8'h00, 4'h0, cmd});
@@ -108,6 +149,52 @@ module tb_mmio;
       tuser = (65'h1001 << 1) | 1; tvalid = 1;
       @(posedge clk); while (!tready) @(posedge clk);
       @(negedge clk); tvalid = 0;
+      $display("MMIO short packet accepted at time=%t", $time);
+    end
+  endtask
+  task send_max_packet;
+    integer beat;
+    begin
+      for (beat = 0; beat < 64; beat = beat + 1) begin
+        @(negedge clk);
+        tdata = {64{8'h61}}; tkeep = 64'hffffffffffffffff;
+        // Keep the wide address assignment separate from the one-bit SOP.
+        // XSim 2021.2 can leave upper bits unknown for a 65-bit OR with a
+        // runtime one-bit expression.
+        tuser = 65'h2002; tuser[0] = (beat == 0);
+        tlast = (beat == 63); tvalid = 1;
+        if (beat == 63) begin
+          tdata[447:440] = 8'h63; // 4087 a bytes followed by c
+          tdata[511:448] = 0; tkeep = 64'h00ffffffffffffff;
+        end
+        @(posedge clk); while (!tready) @(posedge clk);
+      end
+      @(negedge clk); tvalid = 0;
+      $display("MMIO maximum packet accepted at time=%t", $time);
+    end
+  endtask
+  task check_max_captures;
+    integer chunk, lane, word_index;
+    reg [31:0] result_word, expected_word;
+    begin
+      command(3, 1, 8, {16'd512, 16'd1, 32'd7});
+      wr('h20, 0); send_packet();
+      for (chunk = 0; chunk < 33; chunk = chunk + 1) begin
+        poll('hc8, 'h00010101, 'h00000100);
+        for (lane = 0; lane < 16; lane = lane + 1) begin
+          word_index = chunk * 16 + lane;
+          expected_word = word_index == 0 ? 1 : word_index == 1 ? 'h00030000 :
+                          word_index <= 512 ? 32'hffffffff : 0;
+          rd('h80 + lane * 4, result_word);
+          if (result_word !== expected_word)
+            $fatal(1, "Maximum capture mismatch word=%0d expected=%h got=%h", word_index, expected_word, result_word);
+        end
+        wr('h18, 1); poll('hc8, 'h00010101, 1);
+        wr('h18, 0);
+      end
+      poll('hc8, 'h00010101, 0);
+      command(3, 1, 8, {16'd1, 16'd1, 32'd7});
+      check_class_result(1, 'h00030000);
     end
   endtask
   reg [31:0] value;
@@ -161,6 +248,29 @@ module tb_mmio;
     wr('h00, 1);
     configure(); send_packet(); poll('hc8, 'h00010101, 'h00000100);
     rd('h80, value); if (value !== 1) $fatal(1, "Warm reset recovery failed");
+`ifndef RE_HLS_RTL_QUICK
+    // Retire both chunks before reconfiguring this rule.
+    wr('h18, 1); poll('hc8, 'h00010101, 1);
+    wr('h18, 0); poll('hc8, 'h00010101, 'h00000100);
+    wr('h18, 1); poll('hc8, 'h00010101, 1);
+    wr('h18, 0); poll('hc8, 'h00010101, 0);
+    configure_class_rule();
+    $display("MMIO class rule configured at time=%t", $time);
+    check_class_result(1, 'h00030000);
+    check_class_result(1, 'h0ff80000, 1);
+    command(3, 1, 80, 0); // complete-rule class edit
+    check_class_result(0, 0);
+    command(3, 1, 80, 64'h0000000600000000);
+    command(3, 1, 48, 64'h0701640000000000); // literal d
+    check_class_result(0, 0);
+    command(3, 1, 48, 64'h0701630000000000); // literal c
+    check_class_result(1, 'h00030000);
+    command(3, 1, 24, 64'h3b10000600000000); // different loop exit: scalar fallback
+    check_class_result(1, 'h00020000);
+    command(3, 1, 24, 64'h3b10000400000000);
+    check_class_result(1, 'h00030000);
+    check_max_captures();
+`endif
     $display("PASS production RTL: AXI configuration, DMA sidebands, stable MMIO, held acknowledgements, warm reset");
     $finish;
   end

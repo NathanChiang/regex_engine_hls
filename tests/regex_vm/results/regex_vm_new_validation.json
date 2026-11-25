@@ -1,0 +1,120 @@
+{
+  "generated_at_utc": "2026-11-19T08:22:07.094920+00:00",
+  "git_head": "6dfff6c97b1f5bf310d70e9f11f4f2f1c6cd45ab",
+  "current_source_sha256": {
+    "include/hw/xf_data_analytics/text/regexVM_new.hpp": "ca00dfbef526a341840fdfb69191d12d96614cca9ee993487d07ba12e46abce9",
+    "include/hw/xf_data_analytics/text/re_engine.hpp": "f7c70b979f64bd738fb3d1fbc8ecb8b78615cdcf025c74302c79b913b439b659",
+    "kernel/re_engine_kernel.cpp": "1f37febc328d35b79fb69292db5e3cc78936619f4af301816050ca69b547cce1",
+    "kernel/re_engine_kernel.hpp": "a9354e74121808582311cd7b0033f4de70af01d9b0b1f20ef4727fb29b05c98b",
+    "kernel/re_engine_streaming.hpp": "719426311d7ad256bf31de3492c61e0a5eea6408827ad9db9f246185c0fd19c3",
+    "kernel/re_engine_rule_table.hpp": "82b0d571bc0513caaf13f1df6f29fffc8e2995f48cb16dcffba6130f2d98e247",
+    "hls/run_hls.tcl": "b21c6d595d011b1321e9b19b83aed4abe2be5a72ff27162e4964e97686bf439e",
+    "hls/tb_mmio.sv": "c02b078048745ff27d3f60467c9fc4465bbef7da42d8a1e9fd713d9b05054df3"
+  },
+  "device": "xcvc1902-vsva2197-2MP-e-S",
+  "tool_version": "2021.2",
+  "target_clock_ns": 6,
+  "hls_estimated_clock_ns": 4.38,
+  "processing_units": 16,
+  "vm_ii": 6,
+  "result_collector_ii": 2,
+  "validation": {
+    "native_predecoded_core_rtl_cases_passed": 1037,
+    "oniguruma_host": {
+      "success": 439,
+      "vm_calls": 396,
+      "expected_compiler_errors": 43,
+      "fail": 0,
+      "error": 0,
+      "excluded_by_existing_harness": 609
+    },
+    "three_memory_layouts_checked_in_host": true,
+    "descriptor_prepare_rtl": "PASS",
+    "rule_configuration_controller_rtl": "PASS",
+    "ascending_and_descending_class_configuration_rtl": "PASS",
+    "final_mmio_rtl": "PASS",
+    "final_kernel_reference_messages_passed": 100,
+    "final_kernel_telemetry_correlator_drops": 0,
+    "selected_original_opt_generic_cases_correct": 13,
+    "selected_original_opt_generic_cases_total": 15,
+    "maximum_input_bytes_rtl": 4088,
+    "maximum_configured_groups_rtl": 512,
+    "maximum_result_words_checked_rtl": 513,
+    "max_packet_router_fifo_pu_rtl": "PASS",
+    "delayed_packet_join_rtl": "PASS",
+    "dma_burst_address_regression": "PASS with explicit-width TUSER assignment"
+  },
+  "apache_benchmark": {
+    "messages": 100,
+    "rule_bytes": 1288,
+    "instructions": 95,
+    "classes": 16,
+    "new_standalone_vm_mean_cycles": 250.22,
+    "original_opt_standalone_vm_mean_cycles": 1501.76,
+    "standalone_speedup_over_original_opt": 6.001758452561746,
+    "original_kernel_pu_mean_cycles_user_reported_approximate": 2014,
+    "prior_new_integration_means": {
+      "message_bytes": 214.3,
+      "regexVM_cycles": 5843,
+      "kernel_cycles": 17892.67,
+      "iova_cycles": 703.62,
+      "scheduler_cycles": 11186.79,
+      "pu_load_cycles": 77.32,
+      "result_buffer_cycles": 79.48
+    },
+    "final_integration_means": {
+      "message_bytes": 214.3,
+      "regexVM_cycles": 266.22,
+      "kernel_cycles": 1677.68,
+      "iova_cycles": 1329.7,
+      "scheduler_cycles": 6,
+      "pu_load_cycles": 9.38,
+      "result_buffer_cycles": 63.83
+    },
+    "pu_speedup_over_prior_new": 21.948012921643752,
+    "kernel_latency_speedup_over_prior_new": 10.665126841829192,
+    "new_pu_input_bytes_per_clock": 0.8049733303282999
+  },
+  "vivado_out_of_context_synthesis": {
+    "lut": 221935,
+    "ff": 130986,
+    "bram36_tiles": 356,
+    "ramb36": 320,
+    "ramb18": 72,
+    "uram": 136,
+    "dsp": 0,
+    "internal_wns_ns": 0.533,
+    "routed": false,
+    "io_delays_constrained": false
+  },
+  "limitations": [
+    "No uniform 10x gain: small scalar/control-heavy bytecode can be slower than regexVM_opt.",
+    "The two original-opt synthetic possessive-loop mismatches have no speedup ratio.",
+    "Native core RTL regression; narrow/packed variants additionally compared in host tests.",
+    "Current source hashes identify the final kernel build; the VM runtime is unchanged from the broad core RTL run.",
+    "Out-of-context synthesis is not routed timing, complete-platform resource use, or board throughput.",
+    "Existing compiler/search harness exclusions remain; unrestricted worst-case backtracking remains."
+  ],
+  "artifact_sha256": {
+    "regex_vm_cycles.csv": "58214ee788cce296dd64b12f91c825521610713808922b8166f840c8509fb221",
+    "regex_vm_generic_comparison.csv": "7257089f9463ce7d4531eba983d5db44b282cd1ce4f6e95e4e25e1da46f29274",
+    "regex_vm_instr_cclass_cycles.csv": "e22ab82182d62ee9581b06d361c607268f96bfa6188cce9c954a5d2a2022f635",
+    "regex_vm_instr_cclass_rule_bytes.csv": "35d642d360dce804a6e0f936e4485f9c5db80a031069cca362f42b6eccee5b49",
+    "regex_vm_new_after_kernel_cycles.csv": "2ca847ecc44ecfc274535dff3eaf734fafdcc7f95b6a8a288351f8555e1315a1",
+    "regex_vm_new_apache_rtl_cycles.csv": "b0359efb76aeb2c62aaa77714043ccda7241697c5614b8259280209f32d8b66f",
+    "regex_vm_new_before_kernel_cycles.csv": "1d34ca38090933f4bfafc081cd14e996baa6afd09c8f745e71e054644f3a3864",
+    "regex_vm_new_general_rtl_cycles.csv": "7632487bfd2a183f6b675a4db52c72cf5b635da5e2f4a71ac28d067220abbfd9",
+    "regex_vm_original_opt_apache_rtl_cycles.csv": "5641bb628ad04f69b26e103f44a1d6338b5cfeb6725326258fc6491f03d705b6"
+  },
+  "verification_logs": "tests/regex_vm/results/regex_vm_new_validation_logs.zip",
+  "verification_logs_sha256": "890e579a717ac4f7b82889f306a8f865a292072c6b91180bea1693168a29540c",
+  "hls_project": "re_engine_direct_general_verified",
+  "hls_solution": "smoke",
+  "cleanup_summary": "tests/regex_vm/results/regex_vm_new_cleanup.json",
+  "source_recovery_archive": "tests/regex_vm/results/regex_vm_obsolete_sources.zip",
+  "source_recovery_sha256": "47f6b48a43757b4077387f479a501ae91399b4c323139ccd2ddd96e3eba8b64f",
+  "reference_fixture_sha256": {
+    "cosim_expected.txt": "29793820d01093c8ebf875344b2743ec104fad93f77aee33db6c98eebb768fe5",
+    "cosim_input.txt": "2a64f9b5b5bb32dff156fb7de6eb29ea7b2f878e5ba56424f51484749e290154"
+  }
+}

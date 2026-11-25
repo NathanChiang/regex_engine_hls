@@ -1,0 +1,13 @@
+{
+    "status":  "complete",
+    "obsolete_generated_project_directories":  111,
+    "completed_focused_projects":  6,
+    "obsolete_source_entry_files":  22,
+    "removed_files":  46714,
+    "removed_bytes":  14600550677,
+    "recovery_archive":  "tests/regex_vm/results/regex_vm_obsolete_sources.zip",
+    "kept_build_directories":  [
+                                   "hls/build/re_engine_direct_general_verified",
+                                   "hls/build/vivado_re_engine_direct_general_verified"
+                               ]
+}

@@ -186,24 +186,26 @@ int main(int argc, const char* argv[]) {
         messages.empty())
         return 1;
 
+    // const std::string pattern =
+    //     "^(?<remote>[^ ]*) (?<host>[^ ]*) (?<user>[^ ]*) "
+    //     "\\[(?<time>[^\\]]*)\\] \"(?<method>\\S+)(?: "
+    //     "+(?<path>[^\\\"]*?)(?: +\\S*)?)?\" (?<code>[^ ]*) "
+    //     "(?<size>[^ ]*)(?: \"(?<referer>[^\\\"]*)\" "
+    //     "\"(?<agent>[^\\\"]*)\"(?:\\s+"
+    //     "(?<http_x_forwarded_for>[^ ]+))?)?$";
+
     const std::string pattern =
-        "^(?<remote>[^ ]*) (?<host>[^ ]*) (?<user>[^ ]*) "
-        "\\[(?<time>[^\\]]*)\\] \"(?<method>\\S+)(?: "
-        "+(?<path>[^\\\"]*?)(?: +\\S*)?)?\" (?<code>[^ ]*) "
-        "(?<size>[^ ]*)(?: \"(?<referer>[^\\\"]*)\" "
-        "\"(?<agent>[^\\\"]*)\"(?:\\s+"
-        "(?<http_x_forwarded_for>[^ ]+))?)?$";
+        R"(\A[\s\S]*(?:[vV][aA][rR][cC][hH][aA][rR]\(|[eE][xX][eE][cC]\(|[lL][oO][aA][dD]_[fF][iI][lL][eE]\(|[sS][pP]_[cC][oO][nN][fF][iI][gG][uU][rR][eE]|[vV][aA][rR][cC][hH][aA][rR]2\())";
 
     std::vector<unsigned int> bitset(kBitsetWords, 0);
     std::vector<uint64_t> configuration(kInstructionWords, 0);
-    std::vector<uint8_t> capture_names(1024, 0);
-    std::vector<uint32_t> capture_offsets(20, 0);
     unsigned int instruction_count = 0;
     unsigned int class_count = 0;
     unsigned int capture_count = 0;
+    // Capture names are unused; omit metadata extraction for unnamed rules.
     if (xf_re_compile(pattern.c_str(), bitset.data(), configuration.data() + 2,
                       &instruction_count, &class_count, &capture_count,
-                      capture_names.data(), capture_offsets.data()) != 0) {
+                      nullptr, nullptr) != 0) {
         std::cerr << "Regex compilation failed\n";
         return 1;
     }

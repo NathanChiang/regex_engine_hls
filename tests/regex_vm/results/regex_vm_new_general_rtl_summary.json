@@ -1,0 +1,344 @@
+{
+  "literal-8-match": {
+    "cases": 1,
+    "input_bytes_min": 8,
+    "input_bytes_max": 8,
+    "cycles_min": 23,
+    "cycles_median": 23,
+    "cycles_mean": 23,
+    "cycles_max": 23
+  },
+  "literal-8-fail": {
+    "cases": 1,
+    "input_bytes_min": 8,
+    "input_bytes_max": 8,
+    "cycles_min": 17,
+    "cycles_median": 17,
+    "cycles_mean": 17,
+    "cycles_max": 17
+  },
+  "star-backtrack-match": {
+    "cases": 1,
+    "input_bytes_min": 32,
+    "input_bytes_max": 32,
+    "cycles_min": 59,
+    "cycles_median": 59,
+    "cycles_mean": 59,
+    "cycles_max": 59
+  },
+  "star-backtrack-fail": {
+    "cases": 1,
+    "input_bytes_min": 32,
+    "input_bytes_max": 32,
+    "cycles_min": 47,
+    "cycles_median": 47,
+    "cycles_mean": 47,
+    "cycles_max": 47
+  },
+  "class-match": {
+    "cases": 1,
+    "input_bytes_min": 1,
+    "input_bytes_max": 1,
+    "cycles_min": 23,
+    "cycles_median": 23,
+    "cycles_mean": 23,
+    "cycles_max": 23
+  },
+  "class-fail": {
+    "cases": 1,
+    "input_bytes_min": 1,
+    "input_bytes_max": 1,
+    "cycles_min": 17,
+    "cycles_median": 17,
+    "cycles_mean": 17,
+    "cycles_max": 17
+  },
+  "alternate-first": {
+    "cases": 1,
+    "input_bytes_min": 1,
+    "input_bytes_max": 1,
+    "cycles_min": 29,
+    "cycles_median": 29,
+    "cycles_mean": 29,
+    "cycles_max": 29
+  },
+  "alternate-second": {
+    "cases": 1,
+    "input_bytes_min": 1,
+    "input_bytes_max": 1,
+    "cycles_min": 35,
+    "cycles_median": 35,
+    "cycles_mean": 35,
+    "cycles_max": 35
+  },
+  "alternate-fail": {
+    "cases": 1,
+    "input_bytes_min": 1,
+    "input_bytes_max": 1,
+    "cycles_min": 29,
+    "cycles_median": 29,
+    "cycles_mean": 29,
+    "cycles_max": 29
+  },
+  "anchors-match": {
+    "cases": 1,
+    "input_bytes_min": 2,
+    "input_bytes_max": 2,
+    "cycles_min": 35,
+    "cycles_median": 35,
+    "cycles_mean": 35,
+    "cycles_max": 35
+  },
+  "anchors-fail": {
+    "cases": 1,
+    "input_bytes_min": 3,
+    "input_bytes_max": 3,
+    "cycles_min": 29,
+    "cycles_median": 29,
+    "cycles_mean": 29,
+    "cycles_max": 29
+  },
+  "class-greedy": {
+    "cases": 12,
+    "input_bytes_min": 2,
+    "input_bytes_max": 4088,
+    "cycles_min": 47,
+    "cycles_median": 53.0,
+    "cycles_mean": 139,
+    "cycles_max": 1067
+  },
+  "class-possessive": {
+    "cases": 12,
+    "input_bytes_min": 2,
+    "input_bytes_max": 4088,
+    "cycles_min": 23,
+    "cycles_median": 29.0,
+    "cycles_mean": 115,
+    "cycles_max": 1043
+  },
+  "star-window-edge": {
+    "cases": 80,
+    "input_bytes_min": 4,
+    "input_bytes_max": 83,
+    "cycles_min": 47,
+    "cycles_median": 77.0,
+    "cycles_mean": 76.25,
+    "cycles_max": 107
+  },
+  "random-class-loop": {
+    "cases": 160,
+    "input_bytes_min": 5,
+    "input_bytes_max": 202,
+    "cycles_min": 47,
+    "cycles_median": 95.0,
+    "cycles_mean": 379.3625,
+    "cycles_max": 1271
+  },
+  "lazy-class-suffix": {
+    "cases": 36,
+    "input_bytes_min": 3,
+    "input_bytes_max": 4087,
+    "cycles_min": 47,
+    "cycles_median": 119.0,
+    "cycles_mean": 3156.3333333333335,
+    "cycles_max": 97967
+  },
+  "lazy-class-no-suffix": {
+    "cases": 36,
+    "input_bytes_min": 3,
+    "input_bytes_max": 4087,
+    "cycles_min": 71,
+    "cycles_median": 155.0,
+    "cycles_mean": 3198.3333333333335,
+    "cycles_max": 98033
+  },
+  "prefixed-plus-class": {
+    "cases": 21,
+    "input_bytes_min": 4,
+    "input_bytes_max": 128,
+    "cycles_min": 35,
+    "cycles_median": 41,
+    "cycles_mean": 43,
+    "cycles_max": 65
+  },
+  "prefixed-plus-class-fail": {
+    "cases": 21,
+    "input_bytes_min": 4,
+    "input_bytes_max": 128,
+    "cycles_min": 23,
+    "cycles_median": 29,
+    "cycles_mean": 27,
+    "cycles_max": 29
+  },
+  "peek-loop-give-back": {
+    "cases": 7,
+    "input_bytes_min": 3,
+    "input_bytes_max": 131,
+    "cycles_min": 17,
+    "cycles_median": 47,
+    "cycles_mean": 42.714285714285715,
+    "cycles_max": 71
+  },
+  "nested-capture-restore": {
+    "cases": 4,
+    "input_bytes_min": 1,
+    "input_bytes_max": 4,
+    "cycles_min": 77,
+    "cycles_median": 131.0,
+    "cycles_mean": 131,
+    "cycles_max": 185
+  },
+  "nested-capture-no-restore": {
+    "cases": 4,
+    "input_bytes_min": 2,
+    "input_bytes_max": 5,
+    "cycles_min": 65,
+    "cycles_median": 110.0,
+    "cycles_mean": 110,
+    "cycles_max": 155
+  },
+  "class-all-byte-values": {
+    "cases": 256,
+    "input_bytes_min": 65,
+    "input_bytes_max": 65,
+    "cycles_min": 41,
+    "cycles_median": 41.0,
+    "cycles_mean": 41,
+    "cycles_max": 41
+  },
+  "class-all-byte-values-fail": {
+    "cases": 256,
+    "input_bytes_min": 65,
+    "input_bytes_max": 65,
+    "cycles_min": 419,
+    "cycles_median": 419.0,
+    "cycles_mean": 419,
+    "cycles_max": 419
+  },
+  "begin-line-boundary": {
+    "cases": 8,
+    "input_bytes_min": 4,
+    "input_bytes_max": 129,
+    "cycles_min": 77,
+    "cycles_median": 803.0,
+    "cycles_mean": 729.5,
+    "cycles_max": 1577
+  },
+  "begin-line-boundary-fail": {
+    "cases": 8,
+    "input_bytes_min": 4,
+    "input_bytes_max": 129,
+    "cycles_min": 59,
+    "cycles_median": 785.0,
+    "cycles_mean": 711.5,
+    "cycles_max": 1559
+  },
+  "scalar-class-chain": {
+    "cases": 4,
+    "input_bytes_min": 0,
+    "input_bytes_max": 29,
+    "cycles_min": 23,
+    "cycles_median": 188.0,
+    "cycles_mean": 149,
+    "cycles_max": 197
+  },
+  "literal-chain": {
+    "cases": 29,
+    "input_bytes_min": 1,
+    "input_bytes_max": 71,
+    "cycles_min": 29,
+    "cycles_median": 71,
+    "cycles_mean": 69.55172413793103,
+    "cycles_max": 113
+  },
+  "literal-chain-fail": {
+    "cases": 29,
+    "input_bytes_min": 1,
+    "input_bytes_max": 71,
+    "cycles_min": 17,
+    "cycles_median": 59,
+    "cycles_mean": 57.55172413793103,
+    "cycles_max": 101
+  },
+  "bounded-repeat": {
+    "cases": 8,
+    "input_bytes_min": 1,
+    "input_bytes_max": 8,
+    "cycles_min": 23,
+    "cycles_median": 83.0,
+    "cycles_mean": 73.25,
+    "cycles_max": 101
+  },
+  "mark-pop-capture-restore": {
+    "cases": 2,
+    "input_bytes_min": 2,
+    "input_bytes_max": 2,
+    "cycles_min": 77,
+    "cycles_median": 83.0,
+    "cycles_mean": 83,
+    "cycles_max": 89
+  },
+  "mark-pop-fail": {
+    "cases": 2,
+    "input_bytes_min": 2,
+    "input_bytes_max": 2,
+    "cycles_min": 65,
+    "cycles_median": 71.0,
+    "cycles_mean": 71,
+    "cycles_max": 77
+  },
+  "step-back-match": {
+    "cases": 2,
+    "input_bytes_min": 3,
+    "input_bytes_max": 3,
+    "cycles_min": 41,
+    "cycles_median": 41.0,
+    "cycles_mean": 41,
+    "cycles_max": 41
+  },
+  "step-back-underflow": {
+    "cases": 2,
+    "input_bytes_min": 3,
+    "input_bytes_max": 3,
+    "cycles_min": 23,
+    "cycles_median": 23.0,
+    "cycles_mean": 23,
+    "cycles_max": 23
+  },
+  "star-control-suffix": {
+    "cases": 11,
+    "input_bytes_min": 0,
+    "input_bytes_max": 4088,
+    "cycles_min": 29,
+    "cycles_median": 77,
+    "cycles_mean": 186.63636363636363,
+    "cycles_max": 1085
+  },
+  "star-line-boundary": {
+    "cases": 8,
+    "input_bytes_min": 1,
+    "input_bytes_max": 256,
+    "cycles_min": 41,
+    "cycles_median": 53.0,
+    "cycles_mean": 58.25,
+    "cycles_max": 107
+  },
+  "lazy-nullable-suffix": {
+    "cases": 6,
+    "input_bytes_min": 0,
+    "input_bytes_max": 64,
+    "cycles_min": 53,
+    "cycles_median": 899.0,
+    "cycles_mean": 875,
+    "cycles_max": 2357
+  },
+  "overlapping-repetition-fail": {
+    "cases": 2,
+    "input_bytes_min": 32,
+    "input_bytes_max": 96,
+    "cycles_min": 43121,
+    "cycles_median": 519419.0,
+    "cycles_mean": 519419,
+    "cycles_max": 995717
+  }
+}

@@ -34,6 +34,7 @@ proc run_streaming {command} {
 }
 
 set flags "-std=c++14 -D__gmp_const=const -DHLS_TEST -I$root/kernel -I$root/include/hw"
+if {[info exists ::env(RE_VM_II)]} { append flags " -DXF_REGEX_VM_NEW_WIDE_II=$::env(RE_VM_II)" }
 if {$bench eq "smoke" && [info exists ::env(RE_HLS_QUICK_CSIM)] && $::env(RE_HLS_QUICK_CSIM) eq "1"} {
     append flags " -DRE_HLS_QUICK_CSIM"
 }
@@ -66,6 +67,13 @@ set_part xcvc1902-vsva2197-2MP-e-S
 create_clock -period 6 -name default
 # Keep small control/memory-copy loops rolled unless explicitly pipelined.
 config_compile -pipeline_loops 0
+# regexVM_new keeps each descriptor/class/message memory within its two physical
+# read ports. Throughput-driven auto-partitioning changes the
+# local message RAM into three banks and introduces a pipelined modulo-three
+# divider; that transformation is neither required nor functionally safe for
+# this persistent dataflow integration. Source-level partition directives
+# remain in effect for arrays that genuinely require banking.
+config_array_partition -throughput_driven off
 # Reset the FSMs/counters, then software issues CLEAR to invalidate table RAM.
 config_rtl -reset control
 if {$action in {csim synth export}} {

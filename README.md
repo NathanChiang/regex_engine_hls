@@ -40,9 +40,12 @@ verification commands.
 The focused Regex VM checks are:
 
 ```sh
-vitis_hls -f tests/regex_vm/run_hls_new_csim.tcl
-vitis_hls -f tests/regex_vm/run_hls_new_synth.tcl
+RE_VM_BENCH=diff RE_VM_ACTION=csim vitis_hls -f tests/regex_vm/run_hls_new_accel.tcl
+RE_VM_BENCH=diff RE_VM_PREDECODED=1 RE_VM_ACTION=cosim vitis_hls -f tests/regex_vm/run_hls_new_accel.tcl
 ```
+
+See [the focused test guide](tests/regex_vm/README.md) for configuration-path
+regressions, original-VM comparisons, and the reusable reference fixture.
 
 `REGEX_ENGINE_ROOT` may override the package location, but is normally not
 needed because the Tcl and Python entry points derive it from their own paths.

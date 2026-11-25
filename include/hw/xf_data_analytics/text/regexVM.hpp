@@ -1275,9 +1275,11 @@ LOOP_VM:
         // 4: read/write the offsetBuffer simultaneously
         // 5: str_ptr changes in VM1 and VM2 goes into OP which needs character comparision
         // 6: write the offsetBuffer simultaneously
+        // 7: VM2 increments the repeat counter updated by VM1
         if (((pop_stk_1 || push_stk_1) && (pop_stk_2 || push_stk_2)) || !op_exec || (nt_flag_1 != 1) ||
             (update_mem_1 && pop_stk_2) || (update_mem_2 && pop_stk_1) || (use_str_2 && use_str_1) ||
-            (update_mem_1 && update_mem_2))
+            (update_mem_1 && update_mem_2) ||
+            ((opcode_1 == OP_REPEAT || opcode_1 == OP_REPEAT_INC) && opcode_2 == OP_REPEAT_INC))
 
             exec_opt = false;
         // exec_opt = false;
@@ -1288,7 +1290,8 @@ LOOP_VM:
             nt_flag = nt_flag_2;
             end_flag = end_flag_2;
             match_s = match_2;
-            repeat_cnt = repeat_cnt_2;
+            // Preserve VM1's counter update unless VM2 also updates the counter.
+            repeat_cnt = (opcode_2 == OP_REPEAT || opcode_2 == OP_REPEAT_INC) ? repeat_cnt_2 : repeat_cnt_1;
         } else {
             nt_flag = nt_flag_1;
             end_flag = end_flag_1;

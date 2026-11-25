@@ -53,6 +53,51 @@ python tests/regex_vm/run_opt_general_rtl.py
 validation does not depend on this expression. The generic original-VM bench
 records two known synthetic possessive-loop mismatches without speedup ratios.
 
+For the 100 rules in `log_data/re_engine_performance_test_cases.txt` and the
+1,500 lines in `log_data/regex_engine.log`, run:
+
+```powershell
+python tests/regex_vm/run_opt_performance.py
+```
+
+This synthesizes the unchanged `regex_vm_opt_perf.cpp` wrapper and runs
+`test_opt_performance_rtl.sv` in XSim, using the same post-synthesis RTL flow
+as the other standalone benchmarks. On Windows, rule compilation uses the
+existing Linux libraries in `re_compile/lib/lib` through WSL Ubuntu-20.04;
+select another installed distribution with `--wsl-distro`. On Linux, the
+runner loads those libraries directly. Vitis HLS and Vivado 2021.2 must be
+available. Use `--skip-synthesis` to reuse this benchmark's generated RTL.
+
+Inputs stay in file order: 150 lines per category and 15 per rule, with ten
+matches followed by five nonmatches. Fixed rules repeat valid input lengths;
+the negative-length exceptions for 06.08 and 06.09 remain in the input log.
+Generated vectors, RTL, and simulator logs stay under `build/`. The retained
+CSV is `results/regex_vm_opt_performance.csv`, with 1,500 rows identifying the
+rule, case, source log line, input bytes, expected/actual match, correctness,
+execution cycles, latency, and effective processing throughput.
+
+Cycles run from accepted `ap_start` to `ap_done`, excluding rule/input loading.
+Latency and throughput use the nominal 6 ns simulation clock; they are not
+board-level measurements. Match discrepancies are recorded without changing
+the VM or discarding timing rows. The initial run completed all 1,500 cases
+and recorded 14 unexpected nonmatches in rules 10.07 (cases 9-10), 10.08
+(cases 1-10), and 10.09 (cases 9-10). Native Oniguruma independently agreed
+with all input expectations, and the packed vectors matched the log bytes.
+
+Run the identical 100-rule/1,500-input benchmark through the source-compatible,
+narrow `regexVM_new<8192, 4096>` entry point with:
+
+```powershell
+python tests/regex_vm/run_new_performance.py
+```
+
+It uses the same input vectors, memory widths, and nominal 6 ns clock. Results
+are written separately to `results/regex_vm_new_performance.csv`, with the
+same columns as the optimized VM CSV. Generated files stay under
+`build/new_performance_rtl/` and `build/regex_vm_new_performance/`. This measures
+the narrow API; the packed-wide/predecoded kernel interfaces have their own
+benchmarks above. `--skip-synthesis` and `--wsl-distro` are supported here too.
+
 Complete-kernel synthesis and MMIO/AXIS verification use the scripts in
 [`hls/`](../../hls/README.md). To reuse the same reference fixture, pass
 `--lines 100 --vectors-dir tests/regex_vm/fixtures/apache_100` to
